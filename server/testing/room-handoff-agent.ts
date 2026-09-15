@@ -5,14 +5,19 @@ import { appendFileSync, readFileSync, existsSync } from "node:fs";
 import { createInterface } from "node:readline";
 import { waitForExit } from "./cleanup.ts";
 
-export async function runRoomHandoffAgent(argv: string[], planPath: string, prompt?: unknown): Promise<string> {
+type AgentsIntegration = { command: string; args: string[]; env: Record<string, string> };
+
+/** `launch` replaces Claude's argv files for another fake engine: the agents
+ * server it mounted, its instructions, and extra evidence fields. */
+export async function runRoomHandoffAgent(argv: string[], planPath: string, prompt?: unknown,
+  launch?: { integration: AgentsIntegration; system: string; evidence?: Record<string, unknown> }): Promise<string> {
   const arg = (flag: string) => argv[argv.indexOf(flag) + 1];
-  const config = JSON.parse(readFileSync(arg("--mcp-config"), "utf8"));
-  const integration = Object.values(config.mcpServers as Record<string, { command: string; args: string[]; env: Record<string, string> }>)
+  const integration = launch?.integration ?? Object.values(JSON.parse(readFileSync(arg("--mcp-config"), "utf8")).mcpServers as Record<string, AgentsIntegration>)
     .find(s => s.env?.OMB_BOT_ID);
-  if (!integration) throw new Error("The room agent did not receive its agents integration");
+  // A depth-capped delegated turn mounts no agents server: answer from the prompt alone.
+  if (!integration) return `Handled without teammate tools: ${String((prompt as any)?.message?.content ?? "")}`;
   const botId = integration.env.OMB_BOT_ID;
-  const system = readFileSync(arg("--append-system-prompt-file"), "utf8");
+  const system = launch?.system ?? readFileSync(arg("--append-system-prompt-file"), "utf8");
   // Claude snapshots the launch-time system prompt for a session. A retained
   // process or --resume launch receives changed turn-scoped instructions in
   // the user message, so inspect both surfaces just as the model does.
@@ -82,6 +87,7 @@ export async function runRoomHandoffAgent(argv: string[], planPath: string, prom
       });
       if (plan.delayMs) await new Promise(resolve => { delayTimer = setTimeout(resolve, plan.delayMs); });
       if (plan.fail && !resumed) throw new Error("Scripted addressed agent failure");
+      if (plan.failResumed && resumed) throw new Error("Scripted failure of a resumed turn");
       return basePlan.turns ? plan.reply : resumed ? plan.resumeReply ?? `Summary from ${botId}` : plan.reply ?? `Result from ${botId}`;
     })()]);
   } finally {
@@ -92,6 +98,6 @@ export async function runRoomHandoffAgent(argv: string[], planPath: string, prom
       model: argv.includes("--model") ? arg("--model") : undefined,
       permissionMode: argv.includes("--permission-mode") ? arg("--permission-mode") : undefined,
       snapshotMode: argv.includes("--system-prompt-snapshot") ? arg("--system-prompt-snapshot") : undefined,
-      resumed, system, prompt, evidence }) + "\n");
+      resumed, system, prompt, evidence, ...launch?.evidence }) + "\n");
   }
 }

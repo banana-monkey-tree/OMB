@@ -1,175 +1,423 @@
-// U1 (upstreams.md): a delegated/coordinated result returning to its source
-// 1:1 thread now resumes the native session and sends only what that
-// session has not been handed, instead of clearing resumeCursors and
-// replaying up to 40 messages (see server/delta-context.ts). This exercises
-// the real dispatch path end to end, through the same isolated launcher and
-// the repo's own fake Claude CLI (server/testing/fake-claude-cli.ts) used
-// throughout this suite — no real LLM calls.
-//
-// The wrapper below is the same recording pattern
-// server/independent-threads-api.test.ts uses (write a small .mjs that logs
-// argv/env around the unmodified fake, swap it in via
-// PATCH /api/instances/claude {cli}), extended to also capture raw argv
-// (--resume / --session-id) per launch, which the room-handoff plan agent's
-// own evidence log does not record.
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+// Resumed sessions and teammate results, end to end through the isolated
+// launcher and the repository's fake engines: what each provider turn
+// actually received, counted by unique sentinels.
+import { spawn, type ChildProcess } from "node:child_process";
+import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { expect, it } from "vitest";
 
 import { launchVerificationServer, runControlOmb } from "../scripts/control-omb.ts";
 import { request } from "../scripts/mcp-server.ts";
+import { waitForExit } from "./testing/cleanup.ts";
 
-async function fixture(test: (f: any) => Promise<void>) {
-  const session = await launchVerificationServer(process.env, undefined, undefined, undefined, undefined, { scripted: true });
+const count = (text: string, needle: string) => text.split(needle).length - 1;
+const jsonl = (path: string) => existsSync(path)
+  ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+
+async function fixture(test: (f: any) => Promise<void>, options: { env?: NodeJS.ProcessEnv; codex?: Record<string, string> } = {}) {
+  const session = await launchVerificationServer({ ...process.env, ...options.env }, undefined, undefined, undefined, undefined,
+    { scripted: true }, options.codex ? ["codex"] : []);
   const cli = (...args: string[]) => runControlOmb(args, { env: { OPENMAUSBOT_URL: session.info.url } }) as Promise<any>;
   const api = (path: string, body?: unknown, method = "POST") =>
     request(path, body === undefined ? {} : { method, body: JSON.stringify(body) }, session.info.url) as Promise<any>;
+  let restarted: ChildProcess | undefined;
   try {
-    // Record raw process launches (argv shape, --resume/--session-id) to a
-    // JSONL the wrapper appends to, alongside the unmodified fake CLI.
-    const capturePath = join(session.info.dataDir, "launches.jsonl");
-    const fake = pathToFileURL(join(process.cwd(), "server/testing/fake-claude-cli.ts")).href;
-    const wrapper = join(session.info.dataDir, "recording-claude.mjs");
-    writeFileSync(wrapper, [
-      "#!/usr/bin/env node",
-      'import { appendFileSync, readFileSync } from "node:fs";',
-      'import { pathToFileURL } from "node:url";',
-      'const argv = process.argv.slice(2);',
-      'const argAfter = (f) => { const i = argv.indexOf(f); return i === -1 ? null : (argv[i + 1] ?? null); };',
-      'let botId = null, threadId = null;',
-      'const mc = argAfter("--mcp-config");',
-      'if (mc) { try { const cfg = JSON.parse(readFileSync(mc, "utf8")); for (const s of Object.values(cfg.mcpServers ?? {})) { if (s?.env?.OMB_BOT_ID) { botId = s.env.OMB_BOT_ID; threadId = s.env.OMB_THREAD_ID ?? null; } } } catch {} }',
-      `appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ pid: process.pid, t: Date.now(), resume: argAfter("--resume"), sessionIdArg: argAfter("--session-id"), botId, threadId }) + "\\n");`,
-      `await import(${JSON.stringify(fake)});`,
-    ].join("\n"), { mode: 0o700 });
-    // request() throws on a non-2xx response, so reaching past this line at
-    // all already proves the swap succeeded — this endpoint's JSON body
-    // does not itself carry a "status" field (unlike /api/bots/:id's).
-    await api("/api/instances/claude", { cli: wrapper }, "PATCH");
-
-    const chief = (await cli("new-bot", "--name", "Clive", "--section", "Leadership")).bot;
-    const lead = (await cli("new-bot", "--name", "Engineering lead", "--section", "Engineering")).bot;
-    await api(`/api/bots/${chief.id}`, { chiefOfStaff: true, managedSections: ["Engineering"], acknowledgePeerScope: true }, "PATCH");
-    const planPath = join(session.info.dataDir, "room-plan.json");
-    const plan: Record<string, any> = {
-      [chief.id]: { reply: "On it", resumeReply: "Done — the export is verified" },
-      [lead.id]: { reply: "finished the export report" },
+    const dataDir = session.info.dataDir;
+    const planPath = join(dataDir, "room-plan.json");
+    const launchesPath = join(dataDir, "launches.jsonl");
+    // Wrap a fake engine to record each launch's resume argument and owner.
+    const wrap = (name: string, fake: string, env: Record<string, string>) => {
+      const path = join(dataDir, `${name}.mjs`);
+      writeFileSync(path, [
+        "#!/usr/bin/env node",
+        'import { appendFileSync, readFileSync } from "node:fs";',
+        `Object.assign(process.env, ${JSON.stringify(env)});`,
+        "const argv = process.argv.slice(2);",
+        "const after = (flag) => { const i = argv.indexOf(flag); return i === -1 ? null : argv[i + 1] ?? null; };",
+        "let botId = null;",
+        'try { for (const s of Object.values(JSON.parse(readFileSync(after("--mcp-config"), "utf8")).mcpServers ?? {})) botId = s?.env?.OMB_BOT_ID ?? botId; } catch {}',
+        `if (after("--resume") || after("--session-id")) appendFileSync(${JSON.stringify(launchesPath)}, JSON.stringify({ botId, resume: after("--resume"), sessionId: after("--session-id") }) + "\\n");`,
+        `await import(${JSON.stringify(pathToFileURL(join(process.cwd(), "server", "testing", fake)).href)});`,
+      ].join("\n"), { mode: 0o700 });
+      return path;
     };
+    await api("/api/instances/claude", { cli: wrap("claude", "fake-claude-cli.ts", {}) }, "PATCH");
+    if (options.codex) {
+      await api("/api/instances/codex", { cli: wrap("codex", "fake-codex-app-server.ts", { FAKE_CODEX_MODE: "resume", FAKE_CODEX_ROOM_PLAN: planPath, ...options.codex }) }, "PATCH");
+    }
+    const bot = async (name: string, section: string) => (await cli("new-bot", "--name", name, "--section", section)).bot;
+    const chief = await bot("Clive", "Leadership");
+    const lead = await bot("Engineering lead", "Engineering");
+    const qa = await bot("QA", "Engineering");
+    const ops = await bot("Ops", "Engineering");
+    await api(`/api/bots/${chief.id}`, { chiefOfStaff: true, managedSections: ["Engineering"], acknowledgePeerScope: true }, "PATCH");
+    const plan: Record<string, any> = {};
     const save = () => writeFileSync(planPath, JSON.stringify(plan));
     save();
-    const messages = async (threadId: string) => (await api(`/api/threads/${threadId}/messages`)).messages;
-    const wait = () => cli("wait", "--bot", chief.id, "--task", chief.activeTaskId, "--timeout", "30");
-    const launches = () => existsSync(capturePath) ? readFileSync(capturePath, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
-    const chiefLaunches = () => launches().filter((l: any) => l.botId === chief.id).sort((a: any, b: any) => a.t - b.t);
-    const nodes = () => existsSync(join(session.info.dataDir, "room-handoffs.json"))
-      ? JSON.parse(readFileSync(join(session.info.dataDir, "room-handoffs.json"), "utf8")) : [];
-    await test({ session, cli, api, chief, lead, plan, save, wait, messages, launches, chiefLaunches, nodes, planPath });
+    const thread = chief.activeTaskId;
+    const send = async (text: string, threadId = thread) => { save(); return api(`/api/bots/${chief.id}/messages`, { text, threadId }); };
+    const wait = async (threadId = thread) =>
+      expect((await cli("wait", "--bot", chief.id, "--task", threadId, "--timeout", "40")).status).toBe("settled");
+    const turns = (botId = chief.id) => jsonl(`${planPath}.evidence.jsonl`).filter((turn: any) => turn.botId === botId);
+    const prompt = (turn: any) => String(turn?.prompt?.message?.content ?? "");
+    const messages = async (threadId = thread) => (await api(`/api/threads/${threadId}/messages`)).messages;
+    const nodes = () => jsonl(join(dataDir, "room-handoffs.json")).flat();
+    const handed = (threadId = thread) => JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"))
+      .find((b: any) => b.id === chief.id).tasks.find((task: any) => task.threadId === threadId).handedMessages;
+    const launches = (botId = chief.id) => jsonl(launchesPath).filter((launch: any) => launch.botId === botId);
+    const delegate = (key: string, to: any[], message: string, extra: Record<string, unknown> = {}) =>
+      ({ steps: [{ arguments: { bot_ids: to.map((b) => b.id), request_key: key, message } }], reply: "Assigned", resumeReply: "Done", ...extra });
+    const gate = (name: string) => join(dataDir, `${name}.gate`);
+    const useModel = async (instanceId: string) => {
+      const model = (await cli("models")).instances.find((item: any) => item.instanceId === instanceId).models.options[0].id;
+      await cli("set-model", "--bot", chief.id, "--instance", instanceId, "--model", model, "--task", thread);
+    };
+    const open = (path: string) => writeFileSync(path, "open");
+    // Stop this fixture's own server, let the test edit its stored records,
+    // and start it again on the same data.
+    const restart = async (edit: (bots: any[]) => void) => {
+      await waitForExit(restarted ?? session.child, { signal: "SIGTERM" });
+      const bots = JSON.parse(readFileSync(join(dataDir, "bots.json"), "utf8"));
+      edit(bots);
+      writeFileSync(join(dataDir, "bots.json"), JSON.stringify(bots, null, 2));
+      const port = new URL(session.info.url).port;
+      const env: NodeJS.ProcessEnv = {
+        HOME: dataDir, USERPROFILE: dataDir, OMB_DATA_DIR: dataDir, OMB_PORT: port, OMB_WEBHOOK_PORT: String(Number(port) + 1),
+        TEMP: join(dataDir, "tmp"), TMP: join(dataDir, "tmp"), TMPDIR: join(dataDir, "tmp"), PATH: dirname(process.execPath),
+        XDG_CONFIG_HOME: join(dataDir, ".config"), XDG_CACHE_HOME: join(dataDir, ".cache"), XDG_DATA_HOME: join(dataDir, ".local", "share"),
+        FAKE_CLAUDE_MODE: "happy", FAKE_CLAUDE_DUMP: session.fixtureDumpPath,
+      };
+      const log = openSync(session.info.logPath, "a", 0o600);
+      restarted = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(new URL("./index.ts", import.meta.url))],
+        { cwd: fileURLToPath(new URL("..", import.meta.url)), env, stdio: ["ignore", log, log] });
+      closeSync(log);
+      await expect.poll(async () => {
+        try { return (await fetch(`${session.info.url}/api/health`, { signal: AbortSignal.timeout(1_000) })).ok; } catch { return false; }
+      }, { timeout: 20_000 }).toBe(true);
+    };
+    await test({ session, dataDir, cli, api, chief, lead, qa, ops, plan, save, send, wait, turns, prompt, messages, nodes, handed, launches, delegate, gate, open, thread, useModel, restart });
   } finally {
+    if (restarted) await waitForExit(restarted, { signal: "SIGTERM" });
     await session.close();
   }
 }
 
-it("resumes the source session across a coordinate_bots round-trip, with a delta of exactly the unseen thread messages, and no duplicate results", () => fixture(async (f) => {
-  // Two ordinary warm-up turns first, so there is a settled session and
-  // prior chat this instance has already been handed.
-  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "hello there");
-  expect((await f.wait()).status).toBe("settled");
-  const warmup = f.chiefLaunches();
-  expect(warmup).toHaveLength(1);
-  expect(warmup[0].resume).toBeNull(); // first-ever turn: fresh
-  const sessionId = warmup[0].sessionIdArg ?? "fake-session";
+const warmUp = async (f: any, text = "Remember: the final answer must use the codename ORCHID_7Q.") => {
+  f.plan[f.chief.id] = { reply: "Noted." };
+  await f.send(text);
+  await f.wait();
+};
 
-  // Now the coordination round: the chief delegates to Engineering, the
-  // reply lands on the source 1:1 thread, and the chief's node resumes.
-  f.plan[f.chief.id] = {
-    steps: [{ arguments: { bot_ids: [f.lead.id], request_key: "build", message: "Build and verify the CSV export" } }],
-    reply: "Assigned to Engineering",
-    resumeReply: "Done — the export is verified",
-  };
-  f.save();
-  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "Please have Engineering build a CSV export.");
-  expect((await f.wait()).status).toBe("settled");
+it("resumes the source session and gives it each of three results exactly once, with a long brief", () => fixture(async (f) => {
+  await warmUp(f);
+  for (const [bot, tag] of [[f.lead, "LEAD"], [f.qa, "QA"], [f.ops, "OPS"]] as const) {
+    f.plan[bot.id] = { reply: `RESULT_${tag}_START ${"r".repeat(1_200)} RESULT_${tag}_END` };
+  }
+  f.plan[f.chief.id] = f.delegate("fanout", [f.lead, f.qa, f.ops], `BRIEF_START ${"b".repeat(1_500)} BRIEF_END`);
+  await f.send("Have Engineering, QA and Ops each check the release.");
+  await f.wait();
 
-  const chiefLaunches = f.chiefLaunches();
-  expect(chiefLaunches).toHaveLength(3); // warm-up, dispatch turn, resumed return turn
-  const [, dispatchTurn, returnTurn] = chiefLaunches;
+  const returned = f.turns().at(-1);
+  const text = f.prompt(returned);
+  expect(returned.resumed).toBe(true);
+  const launches = f.launches();
+  expect(launches.at(-1).resume).toBe(launches[0].sessionId);
+  for (const tag of ["LEAD", "QA", "OPS"]) {
+    expect(count(text, `RESULT_${tag}_START`)).toBe(1);
+    expect(count(text, `RESULT_${tag}_END`)).toBe(1);
+  }
+  // The session already holds the earlier chat and its own full assignment.
+  expect(text).not.toContain("ORCHID_7Q");
+  expect(text).not.toContain("BRIEF_END");
+  expect(text).not.toMatch(/^Assistant: @/m);
+}), 60_000);
 
-  // (a) resume cursor preserved and --resume used on the return turn — the
-  // SAME session id the warm-up turn established, never reset.
-  expect(dispatchTurn.resume).toBe(sessionId);
-  expect(returnTurn.resume).toBe(sessionId);
+it("gives the return turn a result that landed while a newer message was running, exactly once", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "LEAD_RESULT_TOKEN", gateFile: f.gate("lead") };
+  f.plan[f.chief.id] = { turns: [{}, f.delegate("build", [f.lead], "Build the export"), { reply: "4", gateFile: f.gate("steer") }, { reply: "Done" }] };
+  await f.send("Please have Engineering build the export.");
+  await expect.poll(() => f.nodes().find((node: any) => node.botId === f.lead.id)?.status, { timeout: 15_000 }).toBe("running");
+  expect((await f.send("Meanwhile, what is 2+2?")).queued).toBeUndefined();
+  f.open(f.gate("lead"));
+  await expect.poll(async () => (await f.messages()).some((m: any) => m.tool?.name === "Engineering lead replied"), { timeout: 20_000 }).toBe(true);
+  f.open(f.gate("steer"));
+  await f.wait();
 
-  const chiefMessages = await f.messages(f.chief.activeTaskId);
-  const evidence = readFileSync(`${f.planPath}.evidence.jsonl`, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  const chiefResumedTurn = evidence.filter((e: any) => e.botId === f.chief.id).at(-1);
-  const returnText: string = chiefResumedTurn.prompt.message.content;
+  const returned = f.turns().at(-1);
+  expect(returned.resumed).toBe(true);
+  expect(count(f.prompt(returned), "LEAD_RESULT_TOKEN")).toBe(1);
+  expect(f.launches().at(-1).resume).not.toBeNull();
+}), 60_000);
 
-  // (b) the delta contains exactly the unseen messages on the source
-  // thread: the addressed request to Engineering and its result — not the
-  // warm-up turn this session already ran.
-  expect(returnText).toContain("Build and verify the CSV export");
-  expect(returnText).toContain("finished the export report");
-  expect(returnText).not.toContain("hello there");
+it("offers a result that lands mid-turn after its source was stopped to the next turn, once, labelled", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "STOPPED_SOURCE_RESULT", gateFile: f.gate("lead") };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], "Build the export");
+  await f.send("Please have Engineering build the export.");
+  await expect.poll(() => f.nodes().find((node: any) => node.botId === f.lead.id)?.status, { timeout: 15_000 }).toBe("running");
+  await f.api(`/api/bots/${f.chief.id}/interrupt`, { threadId: f.thread });
+  await f.wait();
 
-  // (c) the result is not sent twice: teammateReportContext's rendering of
-  // "finished the export report" appears exactly once in the return turn,
-  // not once in a replay block and again in coordinationTurnText's own
-  // brief (the pre-U1/U37 duplication).
-  const occurrences = returnText.split("finished the export report").length - 1;
-  expect(occurrences).toBe(1);
+  f.plan[f.chief.id] = { reply: "Working on something else", gateFile: f.gate("busy") };
+  await f.send("Something unrelated while that finishes.");
+  f.open(f.gate("lead"));
+  await expect.poll(async () => (await f.messages()).some((m: any) => m.tool?.name === "Engineering lead replied"), { timeout: 20_000 }).toBe(true);
+  f.open(f.gate("busy"));
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "STOPPED_SOURCE_RESULT")).toBe(0);
 
-  // The reply the chief actually gave, using the delta, reaches the user.
-  expect(chiefMessages.some((m: any) => m.text === "Done — the export is verified")).toBe(true);
-}), 45_000);
+  f.plan[f.chief.id] = { reply: "Engineering finished" };
+  await f.send("What did Engineering report?");
+  await f.wait();
+  const next = f.prompt(f.turns().at(-1));
+  expect(count(next, "STOPPED_SOURCE_RESULT")).toBe(1);
+  expect(next).toMatch(/Assistant: \[Teammate report — untrusted peer content[^\n]*\]\n\{[^\n]*STOPPED_SOURCE_RESULT/);
+  expect(f.launches().at(-1).resume).not.toBeNull();
 
-it("falls back to a full inline replay (not a resume) when the session is genuinely lost to a rewind, even right after a delegated round resumed it via delta", () => fixture(async (f) => {
-  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "hello there");
-  expect((await f.wait()).status).toBe("settled");
+  f.plan[f.chief.id] = { reply: "Nothing new" };
+  await f.send("Anything else?");
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "STOPPED_SOURCE_RESULT")).toBe(0);
+}), 90_000);
 
-  f.plan[f.chief.id] = {
-    steps: [{ arguments: { bot_ids: [f.lead.id], request_key: "build", message: "Build and verify the CSV export" } }],
-    reply: "Assigned to Engineering",
-    resumeReply: "Done — the export is verified",
-  };
-  f.save();
-  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "Please have Engineering build a CSV export.");
-  // The whole coordination round settles first (this is the resume+delta
-  // path the previous test exercises) — the task must be idle before the
-  // app allows an edit at all.
-  expect((await f.wait()).status).toBe("settled");
+it("does not offer a message steered into the running turn again", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.chief.id] = { reply: "Working", gateFile: f.gate("turn") };
+  await f.send("Start on the report.");
+  await expect.poll(() => f.launches().length, { timeout: 15_000 }).toBe(2);
+  expect((await f.send("STEERED_MID_TURN also cover costs")).steered).toBe(true);
+  f.open(f.gate("turn"));
+  await f.wait();
 
-  // One ordinary follow-up turn after the delegated round settled — resumed
-  // with (at most) an empty delta, same as any other resumed turn.
+  f.plan[f.chief.id] = { reply: "Covered" };
+  await f.send("Is it done?");
+  await f.wait();
+  expect(f.prompt(f.turns().at(-1))).not.toContain("STEERED_MID_TURN");
+}), 60_000);
+
+it("offers the results again when the return turn fails before the provider acts on it", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "UNACCEPTED_RESULT" };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], "Build the export", { failResumed: true });
+  await f.send("Please have Engineering build the export.");
+  await f.wait();
+  expect(f.nodes().find((node: any) => !node.parentId).status).toBe("failed");
+
+  f.plan[f.chief.id] = { reply: "Here is what Engineering found" };
+  await f.send("What did Engineering find?");
+  await f.wait();
+  const next = f.prompt(f.turns().at(-1));
+  expect(count(next, "UNACCEPTED_RESULT")).toBe(1);
+  expect(JSON.stringify(f.handed())).not.toContain("card-");
+}), 60_000);
+
+it("offers the results again when the person stops the return turn before the provider acts on it", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "STOPPED_RETURN_RESULT" };
+  f.plan[f.chief.id] = { turns: [{}, f.delegate("build", [f.lead], "Build the export"), { reply: "never sent", gateFile: f.gate("return") }, { reply: "Recovered" }] };
+  await f.send("Please have Engineering build the export.");
+  await expect.poll(() => f.nodes().find((node: any) => node.botId === f.lead.id)?.status, { timeout: 20_000 }).toBe("completed");
+  await expect.poll(() => f.nodes().find((node: any) => !node.parentId)?.status, { timeout: 20_000 }).toBe("running");
+  await f.api(`/api/bots/${f.chief.id}/interrupt`, { threadId: f.thread });
+  await f.wait();
+  f.open(f.gate("return"));
+
+  await f.send("What did Engineering find?");
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "STOPPED_RETURN_RESULT")).toBe(1);
+}), 60_000);
+
+it("rebuilds a rejected resume with each result exactly once", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: `RECOVERY_RESULT_START ${"r".repeat(900)} RECOVERY_RESULT_END` };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], "Build the export");
+  await f.send("Please have Engineering build the export.");
+  await f.wait();
+  const recovered = f.prompt(f.turns().at(-1));
+  expect(recovered).toContain("could not be resumed");
+  expect(recovered).toContain("ORCHID_7Q");
+  expect(count(recovered, "RECOVERY_RESULT_START")).toBe(1);
+  expect(count(recovered, "RECOVERY_RESULT_END")).toBe(1);
+}, { env: { FAKE_CLAUDE_MODE: "dead-session" } }), 60_000);
+
+it("keeps provenance and exactly-once delivery across rework rounds to the same teammate", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { turns: [{ reply: "ROUND_ONE_RESULT" }, { reply: "ROUND_TWO_RESULT" }] };
+  f.plan[f.chief.id] = { turns: [
+    {},
+    f.delegate("r1", [f.lead], "REQUEST_ONE please build it"),
+    { steps: [{ arguments: { bot_ids: [f.lead.id], request_key: "r2", message: "REQUEST_TWO please also test it", rework: true } }], reply: "" },
+    { reply: "" },
+  ] };
+  await f.send("Please have Engineering build and then test it.");
+  await f.wait();
+
+  const [, , roundOne, roundTwo] = f.turns();
+  expect(count(f.prompt(roundOne), "ROUND_ONE_RESULT")).toBe(1);
+  expect(count(f.prompt(roundTwo), "ROUND_TWO_RESULT")).toBe(1);
+  expect(count(f.prompt(roundTwo), "ROUND_ONE_RESULT")).toBe(0);
+  expect(f.launches().at(-1).resume).not.toBeNull();
+
+  const second = f.prompt(f.turns(f.lead.id)[1]);
+  expect(count(second, "REQUEST_TWO")).toBe(1);
+  expect(second).not.toMatch(/^Assistant: @/m);
+  expect(second).toContain("untrusted peer content");
+
+  // Only stored message ids are recorded, never a continuation's synthetic id.
+  const handed = f.handed();
+  const stored = new Set((await f.messages()).map((m: any) => m.id));
+  for (const state of Object.values(handed) as any[]) {
+    for (const id of [state.through, ...state.ids].filter(Boolean)) expect(stored.has(id), id).toBe(true);
+  }
+}), 90_000);
+
+it("replays a delegated result once after a rewind, and keeps resuming afterwards", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "REWIND_RESULT" };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], "Build the export");
+  await f.send("Please have Engineering build the export.");
+  await f.wait();
   f.plan[f.chief.id] = { reply: "Anything else?" };
-  f.save();
-  await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", "Thanks.");
-  expect((await f.wait()).status).toBe("settled");
+  await f.send("Thanks.");
+  await f.wait();
 
-  // Rewind THAT follow-up (not the original delegating message — editing it
-  // would fork the branch before the delegated round, discarding it) — the
-  // only mapped way (control-omb's own `edit` command comment) to make the
-  // NEXT provider turn REBUILD rather than resume. A session lost this way
-  // must fall back to today's full replay regardless of any handed
-  // watermark delta-context.ts holds; the delegated round stays on the
-  // active branch because it happened BEFORE the edited message.
-  const followup = (await f.messages(f.chief.activeTaskId)).findLast((m: any) => m.role === "user");
-  f.plan[f.chief.id] = { reply: "Rebuilt from the replay" };
+  const followup = (await f.messages()).findLast((m: any) => m.role === "user");
+  f.plan[f.chief.id] = { reply: "Rebuilt" };
   f.save();
-  await f.cli("edit", "--bot", f.chief.id, "--message", followup.id, "--task", f.chief.activeTaskId,
-    "--text", "Thanks — one more thing (edited).");
-  expect((await f.wait()).status).toBe("settled");
+  await f.cli("edit", "--bot", f.chief.id, "--message", followup.id, "--task", f.thread, "--text", "Thanks, one more thing (edited).");
+  await f.wait();
+  const rewound = f.prompt(f.turns().at(-1));
+  expect(rewound).toContain("rewound this conversation");
+  expect(count(rewound, "REWIND_RESULT")).toBe(1);
+  expect(f.launches().at(-1).resume).toBeNull();
 
-  const evidence = readFileSync(`${f.planPath}.evidence.jsonl`, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  const rewoundTurn = evidence.filter((e: any) => e.botId === f.chief.id).at(-1);
-  const rewoundLaunch = f.chiefLaunches().at(-1);
-  // Not resumed: a fresh session, the same as pre-U1 behaviour for this case.
-  expect(rewoundLaunch.resume).toBeNull();
-  // The full active branch replayed inline, including the earlier teammate
-  // report this same task received a delta for a moment ago — the fallback
-  // is a superset, never a loss, of what the delta path would have sent.
-  const rewoundPrompt: string = rewoundTurn.prompt.message.content;
-  expect(rewoundPrompt).toContain("edited");
-  expect(rewoundPrompt).toContain("finished the export report");
-  expect(rewoundPrompt).toContain("rewound this conversation");
-}), 45_000);
+  f.plan[f.chief.id] = { reply: "Still here" };
+  await f.send("And now?");
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "REWIND_RESULT")).toBe(0);
+  expect(f.launches().at(-1).resume).not.toBeNull();
+}), 90_000);
+
+it("wakes a busy delegate_bot source with the reply that landed during its turn, once and labelled", () => fixture(async (f) => {
+  f.plan[f.chief.id] = { turns: [
+    { steps: [
+      { tool: "delegate_bot", arguments: { bot_id: f.qa.id, message: "Check the quality: QA_FACT_TOKEN" } },
+      { tool: "delegate_bot", arguments: { bot_id: f.ops.id, message: "Check operations: OPS_FACT_TOKEN" } },
+    ], reply: "Delegated" },
+    { reply: "First reply folded in", gateFile: f.gate("revival") },
+    { reply: "Second reply folded in" },
+  ] };
+  f.save();
+  const created = await f.api("/api/routines", {
+    name: "Delegation fixture", prompt: "Delegate the checks.", botId: f.chief.id, enabled: false,
+    schedule: { type: "interval", everyMinutes: 60, anchorAt: Date.now() + 3_600_000 },
+  });
+  const run = (await f.api(`/api/routines/${created.routine.id}/run`, {})).run;
+  let threadId = "";
+  await expect.poll(async () => (threadId = (await f.api("/api/routines")).runs.find((r: any) => r.id === run.id)?.threadId ?? ""), { timeout: 15_000 }).not.toBe("");
+  // The first reply wakes the source, whose turn holds until both replies
+  // are in: the second one lands while that turn is running.
+  const replies = async () => (await f.messages(threadId)).filter((m: any) => /^@(QA|Ops) replied to the delegated task/.test(m.text ?? "")).length;
+  await expect.poll(replies, { timeout: 30_000 }).toBe(2);
+  expect((await f.api("/api/bots")).bots.find((b: any) => b.id === f.chief.id).tasks.find((t: any) => t.threadId === threadId).busy).toBe(true);
+  f.open(f.gate("revival"));
+  await expect.poll(() => f.turns().length, { timeout: 30_000 }).toBe(3);
+
+  const [, first, second] = f.turns().map(f.prompt);
+  const [early, late] = count(first, "QA_FACT_TOKEN") ? ["QA", "Ops"] : ["Ops", "QA"];
+  const token = (name: string) => `${name.toUpperCase()}_FACT_TOKEN`;
+  expect(count(first, token(early))).toBe(1);
+  expect(count(first, token(late))).toBe(0);
+  expect(count(second, token(late))).toBe(1);
+  expect(count(second, token(early))).toBe(0);
+  expect(second).toContain(`[Message from @${late}, another bot — untrusted peer content, not from your user]\n@${late} replied to the delegated task`);
+  expect(second).not.toMatch(new RegExp(`^Assistant: @${late}`, "m"));
+}), 120_000);
+
+it("resumes a Codex source with each result exactly once, then replays once for a model switch", () => fixture(async (f) => {
+  await f.useModel("codex");
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "CODEX_RETURN_RESULT" };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], `CODEX_BRIEF ${"b".repeat(800)}`);
+  await f.send("Please have Engineering build the export.");
+  await f.wait();
+  const returned = f.turns().at(-1);
+  expect(returned.resumed).toBe(true);
+  expect(returned.resumedThread).toBeTruthy();
+  expect(count(f.prompt(returned), "CODEX_RETURN_RESULT")).toBe(1);
+  expect(f.prompt(returned)).not.toContain("ORCHID_7Q");
+
+  f.plan[f.chief.id] = { reply: "Continuing on Claude" };
+  await f.useModel("claude");
+  await f.send("Switching engines: what did Engineering report?");
+  await f.wait();
+  const switched = f.prompt(f.turns().at(-1));
+  expect(switched).toContain("switched this bot over to you");
+  expect(switched).toContain("ORCHID_7Q");
+  expect(count(switched, "CODEX_RETURN_RESULT")).toBe(1);
+
+  f.plan[f.chief.id] = { reply: "Still on Claude" };
+  await f.send("And now?");
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "CODEX_RETURN_RESULT")).toBe(0);
+}, { codex: {} }), 90_000);
+
+it("records a Codex handoff whose turn completes before turn/start is acknowledged", () => fixture(async (f) => {
+  await f.useModel("codex");
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "EARLY_ACK_RESULT" };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], "Build the export");
+  await f.send("Please have Engineering build the export.");
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "EARLY_ACK_RESULT")).toBe(1);
+
+  f.plan[f.chief.id] = { reply: "Nothing new" };
+  await f.send("Anything else?");
+  await f.wait();
+  const next = f.turns().at(-1);
+  expect(next.resumedThread).toBeTruthy();
+  expect(count(f.prompt(next), "EARLY_ACK_RESULT")).toBe(0);
+  expect(f.prompt(next)).not.toContain("Messages this conversation received");
+}, { codex: { FAKE_CODEX_COMPLETE_BEFORE_ACK: "1" } }), 90_000);
+
+// A result that arrives after a restart, for a stored conversation with or
+// without a record of what its session received.
+const resultAcrossRestart = async (f: any, stripRecord: boolean) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "never finishes", gateFile: f.gate("never") };
+  f.plan[f.chief.id] = f.delegate("build", [f.lead], "Build the export");
+  await f.send("Please have Engineering build the export.");
+  await expect.poll(() => f.nodes().find((node: any) => node.botId === f.lead.id)?.status, { timeout: 15_000 }).toBe("running");
+  await f.api(`/api/bots/${f.chief.id}/interrupt`, { threadId: f.thread });
+  await f.wait();
+  await f.restart((bots: any[]) => {
+    if (!stripRecord) return;
+    for (const task of bots.find((b: any) => b.id === f.chief.id).tasks) { delete task.handedMessages; delete task.handedWatermarks; }
+  });
+  await expect.poll(async () => (await f.messages()).some((m: any) => m.roomRequest?.phase === "result"), { timeout: 20_000 }).toBe(true);
+  f.plan[f.chief.id] = { reply: "Engineering was interrupted" };
+  await f.send("What happened to the Engineering work?");
+  await f.wait();
+  return f.turns().at(-1);
+};
+
+it("replays once for a stored conversation without a handoff record when a result arrives after restart", () => fixture(async (f) => {
+  const turn = await resultAcrossRestart(f, true);
+  expect(count(f.prompt(turn), "Interrupted by server restart")).toBe(1);
+  expect(f.prompt(turn)).toContain("ORCHID_7Q");
+  expect(f.launches().at(-1).resume).toBeNull();
+  f.plan[f.chief.id] = { reply: "ok" };
+  await f.send("Thanks.");
+  await f.wait();
+  expect(count(f.prompt(f.turns().at(-1)), "Interrupted by server restart")).toBe(0);
+  expect(f.launches().at(-1).resume).not.toBeNull();
+}), 90_000);
+
+it("keeps resuming a stored conversation with a handoff record when a result arrives after restart", () => fixture(async (f) => {
+  const turn = await resultAcrossRestart(f, false);
+  expect(count(f.prompt(turn), "Interrupted by server restart")).toBe(1);
+  expect(f.prompt(turn)).not.toContain("ORCHID_7Q");
+  expect(f.launches().at(-1).resume).not.toBeNull();
+}), 90_000);
