@@ -27,6 +27,7 @@ import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
 import type { GroupGoalRunCardData } from "../shared/group-goal-run.ts";
+import type { HandedState } from "./delta-context.ts";
 
 export type MausColor =
   | "green"
@@ -378,17 +379,9 @@ export interface TaskRecord {
    * a folder that moved under a live session would break resume. `null`
    * = pinned to the default (home); absent = not pinned yet. */
   cwd?: string | null;
-  /** U1 (upstreams.md), per provider instance: the id of the last
-   * active-branch message that instance has been "handed" — its own turns
-   * count as handed, and so does any message a prior delta already carried.
-   * Advanced only from markHanded, itself called only once a dispatch is
-   * accepted (never on a dispatch that failed before the provider started)
-   * and again when that instance's own reply lands. See
-   * server/delta-context.ts. Absent = no recorded handed state, which a
-   * resumed turn treats as "nothing unseen to add" (see
-   * selectUnseenMessages), not "everything is unseen" — so tasks from
-   * before this field existed behave exactly as they did before it. */
-  handedWatermarks?: Record<string, string>;
+  /** per instance: the stored messages that instance's native session has
+   * been handed on this task (server/delta-context.ts) */
+  handedMessages?: Record<string, HandedState>;
 }
 
 const TASK_PATCH_FIELDS = [
@@ -2053,21 +2046,10 @@ export class Store {
     this.saveBots();
   }
 
-  /** U1 (upstreams.md): advance one instance's delta-context "handed"
-   * watermark on this task, forward-only in append order. Two callers, both
-   * in server/index.ts: once a dispatch to `instanceId` is accepted (never
-   * on a dispatch that failed before the provider started — that code path
-   * never reaches this call, so nothing needs "unmarking"), and again when
-   * that same instance's own reply lands, so the next turn's delta never
-   * repeats a turn the resumed session already produced. `messageId` must
-   * be a message actually on the task's active branch. See
-   * server/delta-context.ts for how the watermark is consumed. */
-  markHanded(botId: string, threadId: string, instanceId: string, messageId: string) {
+  setHandedMessages(botId: string, threadId: string, instanceId: string, state: HandedState) {
     const task = this.taskByThread(botId, threadId);
-    if (!task) return;
-    const watermarks = task.handedWatermarks ?? (task.handedWatermarks = {});
-    if (watermarks[instanceId] === messageId) return;
-    watermarks[instanceId] = messageId;
+    if (!task || JSON.stringify(task.handedMessages?.[instanceId]) === JSON.stringify(state)) return;
+    task.handedMessages = { ...task.handedMessages, [instanceId]: state };
     this.saveBots();
   }
 

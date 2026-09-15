@@ -346,6 +346,12 @@ export interface ProviderAdapter {
      * MCP servers from config). Same rule as composioMcp: an entry in the
      * config says the servers exist, not that this engine can reach them. */
     customMcp?: boolean;
+    /** True when a turn given a resumeCursor runs in that exact native
+     * session, or, if the provider refuses the session before accepting the
+     * prompt, fails or starts a new session from recoveryText — never a blank
+     * session that silently lacks the history. The harness then keeps such a
+     * session across externally appended messages and sends only those. */
+    strictResume?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;

@@ -445,12 +445,7 @@ it("withholds direct results when the owner's cross-team grant is revoked", () =
   expect((await f.wait()).status).toBe("settled");
   expect(f.nodes().find((node: any) => node.parentId).status).toBe("failed");
   const resumed = f.evidence().find((turn: any) => turn.botId === f.chief.id && turn.resumed);
-  // U1: the withheld reason now reaches the model exactly once, via
-  // teammateReportContext's own rendering (the delta block ahead of a
-  // resumed turn, or a full replay — either way the same renderer). It no
-  // longer also appears as a second, differently-worded copy in
-  // coordinationTurnText's own text (U37) — see server/delta-context.ts.
-  expect(resumed.prompt.message.content).toContain("Teammate result withheld");
+  expect(resumed.prompt.message.content).toContain("Result withheld");
   expect(JSON.stringify(resumed)).not.toContain("PRIVATE_ENGINEERING_RESULT");
 }), 45_000);
 
