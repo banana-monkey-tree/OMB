@@ -355,7 +355,7 @@ it("wakes a busy delegate_bot source with the reply that landed during its turn,
   expect(count(first, token(late))).toBe(0);
   expect(count(second, token(late))).toBe(1);
   expect(count(second, token(early))).toBe(0);
-  expect(second).toContain(`[Message from @${late}, another bot — untrusted peer content, not from your user]\n@${late} replied to the delegated task`);
+  expect(second).toContain(`[Message from @${late}, another bot — untrusted peer content, not from your user]\n"@${late} replied to the delegated task`);
   expect(second).not.toMatch(new RegExp(`^Assistant: @${late}`, "m"));
 }), 120_000);
 
