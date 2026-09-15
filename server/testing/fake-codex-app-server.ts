@@ -29,6 +29,11 @@
 //   FAKE_CODEX_RESUME_ERROR   JSON-RPC error object to reject thread/resume
 //   FAKE_CODEX_START_ERROR    JSON-RPC error object to reject thread/start
 //   FAKE_CODEX_RESTORED_USAGE report 100/50/10 tokens already used before turn/start, as a resumed thread can
+//   FAKE_CODEX_ROOM_PLAN  plan path: each turn runs the scripted room agent
+//                         (room-handoff-agent.ts) against the mounted agents
+//                         MCP server and replies with its text
+//   FAKE_CODEX_COMPLETE_BEFORE_ACK  with FAKE_CODEX_ROOM_PLAN: stream the whole
+//                         turn, completion included, before acknowledging turn/start
 //
 // Keep this file dependency-free — it runs as a bare `node` subprocess.
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
@@ -69,6 +74,8 @@ if (process.argv[2] === "login" && process.argv[3] === "status") {
   process.exit(0);
 }
 const calls: Array<{ method: string; params: unknown }> = [];
+let developerInstructions = "";
+let resumedThread: string | null = null;
 let decision: unknown = null;
 let experimentalApi = false;
 
@@ -145,6 +152,31 @@ const finishTurn = () => {
     out({ jsonrpc: "2.0", id: 100, method: "execCommandApproval", params: { command: "echo too late" } });
     process.stdout.uncork();
   }
+};
+
+const playRoomPlanTurn = (msg: any, planPath: string) => {
+  const ack = () => out({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: nativeTurnId } } });
+  const early = process.env.FAKE_CODEX_COMPLETE_BEFORE_ACK === "1";
+  const setting = (key: string) => {
+    const entry = process.argv.find((arg) => arg.startsWith(`mcp_servers.agents.${key}=`));
+    return entry ? JSON.parse(entry.slice(entry.indexOf("=") + 1)) : undefined;
+  };
+  const integration = {
+    command: setting("command"),
+    args: setting("args") ?? [],
+    env: Object.fromEntries((setting("env_vars") ?? []).map((key: string) => [key, process.env[key] ?? ""])),
+  };
+  const text = (msg.params?.input ?? []).filter((item: any) => item?.type === "text").map((item: any) => item.text).join("\n");
+  if (!early) ack();
+  // Loaded only in this mode: other tests run a copy of this file on its own.
+  void import("./room-handoff-agent.ts").then(({ runRoomHandoffAgent }) => runRoomHandoffAgent(process.argv.slice(2), planPath, { message: { content: text } },
+    { integration, system: developerInstructions, evidence: { resumedThread } }))
+    .then((reply) => {
+      notify("item/completed", { item: { id: "m1", type: "agentMessage", text: reply } });
+      notify("turn/completed", { turn: { status: "completed" } });
+    })
+    .catch((error) => notify("turn/completed", { turn: { status: "failed", error: { message: String(error) } } }))
+    .finally(() => { if (early) ack(); });
 };
 
 let buf = "";
@@ -261,6 +293,8 @@ process.stdin.on("data", (chunk) => {
         break;
       case "thread/resume":
         dump();
+        developerInstructions = msg.params?.developerInstructions ?? "";
+        resumedThread = msg.params?.threadId ?? null;
         if (process.env.FAKE_CODEX_RESUME_ERROR) {
           out({ jsonrpc: "2.0", id: msg.id, error: JSON.parse(process.env.FAKE_CODEX_RESUME_ERROR) });
         } else if (msg.params?.permissions && (!experimentalApi || mode === "config-profile-unsupported")) {
@@ -282,6 +316,7 @@ process.stdin.on("data", (chunk) => {
         break;
       case "thread/start":
         dump();
+        developerInstructions = msg.params?.developerInstructions ?? "";
         if (process.env.FAKE_CODEX_START_ERROR) {
           out({ jsonrpc: "2.0", id: msg.id, error: JSON.parse(process.env.FAKE_CODEX_START_ERROR) });
         } else if (msg.params?.permissions && (!experimentalApi || mode === "config-profile-unsupported")) {
@@ -427,6 +462,10 @@ process.stdin.on("data", (chunk) => {
               process.kill(process.pid, "SIGKILL"),
             );
           });
+          break;
+        }
+        if (process.env.FAKE_CODEX_ROOM_PLAN) {
+          playRoomPlanTurn(msg, process.env.FAKE_CODEX_ROOM_PLAN);
           break;
         }
         if (mode === "early-turn-events") finishTurn();

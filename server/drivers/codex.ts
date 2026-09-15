@@ -1261,10 +1261,12 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               promptSubmitted,
               producedOutput: state.sawStreamDelta,
             });
-            if (!config.managed || recoveredMissingSession || stopRequested || state.settled ||
+            if ((!config.managed && !turn.recoveryIsReplay) || recoveredMissingSession || stopRequested || state.settled ||
                 !turn.recoveryText?.trim() || !missingNativeCodexThread(error, cursor) || !mayReplay(failure)) throw error;
-            // The prompt has never been submitted. Rebuild only missing Company
-            // histories, once, through the same approved model/provider below.
+            // The prompt has never been submitted. Rebuild missing Company
+            // histories, and a personal thread only for a turn whose recovery
+            // text is the replay it would have had anyway; once, through the
+            // same approved model/provider below.
             recoveredMissingSession = true;
             promptText = recoveryPromptFor({ recoveryText: turn.recoveryText, currentText: turn.text, failure }).text;
           }
@@ -1292,7 +1294,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         if (!codexThreadId) throw new Error("Codex did not return a native thread id");
         await syncCodexInstructions(threadId, codexThreadId, developerInstructions, resumedNativeThread, request);
-        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null });
+        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null, ...(recoveredMissingSession ? { rebuilt: true } : {}) });
         const turnInput = [
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...(turn.images ?? []).map((image) => ({ type: "localImage" as const, path: image.path })),
@@ -1430,6 +1432,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         images: true,
         nativeImageInput: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        strictResume: true,
       },
       sendTurn,
       interruptTurn: async (threadId) => {

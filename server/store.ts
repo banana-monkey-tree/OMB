@@ -27,6 +27,7 @@ import type { RoutineRequestCardData } from "../shared/routine-request.ts";
 import type { RoutineRunCardData } from "../shared/routine-run.ts";
 import type { SkillRequestCardData } from "../shared/skill-request.ts";
 import type { GroupGoalRunCardData } from "../shared/group-goal-run.ts";
+import type { HandedState } from "./delta-context.ts";
 
 export type MausColor =
   | "green"
@@ -378,6 +379,9 @@ export interface TaskRecord {
    * a folder that moved under a live session would break resume. `null`
    * = pinned to the default (home); absent = not pinned yet. */
   cwd?: string | null;
+  /** per instance: the stored messages that instance's current native
+   * session has been handed on this task (server/delta-context.ts) */
+  handedMessages?: Record<string, HandedState>;
 }
 
 const TASK_PATCH_FIELDS = [
@@ -2039,6 +2043,16 @@ export class Store {
     const task = this.taskByThread(botId, threadId);
     if (!task || task.lastInstanceId === instanceId) return;
     task.lastInstanceId = instanceId;
+    this.saveBots();
+  }
+
+  setHandedMessages(botId: string, threadId: string, instanceId: string, state: HandedState) {
+    const task = this.taskByThread(botId, threadId);
+    if (!task || JSON.stringify(task.handedMessages?.[instanceId]) === JSON.stringify(state)) return;
+    // Other instances keep a record only while it still describes their session.
+    const live = Object.entries(task.handedMessages ?? {})
+      .filter(([id, record]) => id !== instanceId && record.session !== undefined && record.session === task.resumeCursors[id]);
+    task.handedMessages = { ...Object.fromEntries(live), [instanceId]: state };
     this.saveBots();
   }
 
