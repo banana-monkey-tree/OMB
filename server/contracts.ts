@@ -91,6 +91,10 @@ export interface RuntimeEventBase {
   itemId?: string;
   requestId?: string;
   raw?: { source: string; payload: unknown };
+  /** Text the provider's own client produced instead of the model (an API
+   * error it reports as a reply). Rendered like any other item, but not a
+   * sign that the model received or acted on the prompt. */
+  synthetic?: boolean;
 }
 
 export type RuntimeEvent = RuntimeEventBase &
@@ -349,8 +353,10 @@ export interface ProviderAdapter {
     /** True when a turn given a resumeCursor runs in that exact native
      * session, or, if the provider refuses the session before accepting the
      * prompt, fails or starts a new session from recoveryText — never a blank
-     * session that silently lacks the history. The harness then keeps such a
-     * session across externally appended messages and sends only those. */
+     * session that silently lacks the history. A session.started whose id is
+     * not the cursor therefore announces a session built from recoveryText.
+     * The harness then keeps such a session across externally appended
+     * messages and sends only those. */
     strictResume?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;

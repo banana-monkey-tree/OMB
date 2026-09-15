@@ -8,9 +8,11 @@ import { waitForExit } from "./cleanup.ts";
 type AgentsIntegration = { command: string; args: string[]; env: Record<string, string> };
 
 /** `launch` replaces Claude's argv files for another fake engine: the agents
- * server it mounted, its instructions, and extra evidence fields. */
+ * server it mounted, its instructions, and extra evidence fields. `progress`
+ * streams a plan's `progress` text before the turn waits on its gate. */
 export async function runRoomHandoffAgent(argv: string[], planPath: string, prompt?: unknown,
-  launch?: { integration: AgentsIntegration; system: string; evidence?: Record<string, unknown> }): Promise<string> {
+  launch?: { integration: AgentsIntegration; system: string; evidence?: Record<string, unknown> },
+  progress?: (text: string) => void): Promise<string> {
   const arg = (flag: string) => argv[argv.indexOf(flag) + 1];
   const integration = launch?.integration ?? Object.values(JSON.parse(readFileSync(arg("--mcp-config"), "utf8")).mcpServers as Record<string, AgentsIntegration>)
     .find(s => s.env?.OMB_BOT_ID);
@@ -76,6 +78,7 @@ export async function runRoomHandoffAgent(argv: string[], planPath: string, prom
         evidence.push({ step, response });
         if (Boolean(response.error || response.result?.isError) !== Boolean(step.expectError)) throw new Error(`Unexpected tool outcome: ${JSON.stringify(response)}`);
       }
+      if (typeof plan.progress === "string") progress?.(plan.progress);
       // Let a race fixture release this exact turn after its settings mutation,
       // independent of machine load. The run timeout also bounds this wait.
       if (plan.gateFile && !existsSync(plan.gateFile)) await new Promise<void>(resolve => {

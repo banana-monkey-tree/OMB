@@ -231,7 +231,7 @@ import {
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh } from "./turn-context.ts";
-import { handedStateUsable, peerMessageText, recordHanded, renderUnseen, unseenMessages, withUnseenMessages, type ContextMessage } from "./delta-context.ts";
+import { Handoffs, handedStateUsable, peerMessageText, recordHanded, renderUnseen, sessionStart, unseenMessages, withUnseenMessages, type ContextMessage, type Handoff } from "./delta-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnResources, workspaceResource, type TurnOwner } from "./turn-resources.ts";
@@ -3915,7 +3915,7 @@ bus.subscribe((event: RuntimeEvent) => {
     pushMessage({ role: "bot", kind: "text", text: coordinatorVisibleText, turnId: completedTurnId });
     lastReply.set(event.threadId, coordinatorVisibleText);
   }
-  if (bot) noteTurnAcceptance(event);
+  if (bot) handoffs.onEvent(event);
 
   switch (event.type) {
     case "session.started":
@@ -4525,11 +4525,14 @@ function isExternalContextMarker(value: string | undefined): boolean {
 function markTaskContextExternallyUpdated(bot: BotRecord, threadId: string): void {
   const task = store.taskByThread(bot.id, threadId);
   if (!task) return;
-  // An engine that records exactly which messages its session received keeps
-  // that session: its next turn is sent what it has not seen. Without such a
-  // record (another engine, or a task from before it existed) replay once.
+  // An engine that records which messages its current session was handed
+  // keeps that session: its next turn is sent what it has not seen. Without a
+  // record for that exact session (another engine, a replaced session, or a
+  // task from before records existed) the next turn replays once, as before.
   const owner = task.lastInstanceId;
-  if (owner && task.handedMessages?.[owner] && registry.get(owner)?.adapter.capabilities.strictResume) {
+  const record = owner ? task.handedMessages?.[owner] : undefined;
+  if (owner && record?.session !== undefined && record.session === task.resumeCursors[owner] &&
+    registry.get(owner)?.adapter.capabilities.strictResume) {
     store.patchTask(bot.id, threadId, { unread: true });
     return;
   }
@@ -4545,69 +4548,13 @@ function isContextMessage(m: Message): boolean {
   return Boolean((m.kind === "text" && m.text) || m.roomRequest?.phase === "result");
 }
 
-/** What one direct turn put in front of a strict-resume provider. */
-interface PendingHandoff {
-  botId: string;
-  instanceId: string;
-  claimId?: string;
-  turnId?: string;
-  /** the session the turn asked to resume */
-  resumeCursor: unknown;
-  /** the turn rebuilds the session from the branch up to `through` */
-  replace: boolean;
-  through?: string;
-  /** unseen messages rendered into the turn */
-  placed: string[];
-  /** messages the turn's own text carries */
-  carried: string[];
-  /** messages a driver's recovery rebuild replays */
-  recoveryWindow: ReadonlySet<string>;
-  accepted: boolean;
-}
-const pendingHandoffs = new Map<string, PendingHandoff>();
-
-function recordHandoff(threadId: string, pending: PendingHandoff, ids: Iterable<string>): void {
-  const task = store.taskByThread(pending.botId, threadId);
-  if (!task) return;
-  const order = store.activePath(threadId).filter(isContextMessage).map((m) => m.id);
-  const next = pending.replace
-    ? recordHanded(undefined, order, ids, pending.through)
-    : recordHanded(task.handedMessages?.[pending.instanceId], order, ids);
-  pending.replace = false;
-  store.setHandedMessages(pending.botId, threadId, pending.instanceId, next);
-}
-
-/** Record a direct turn's handoff once its provider acts on the prompt:
- * streamed output, a tool call or ask, or a successful completion. A turn
- * that fails or is stopped before that hands nothing, so what it would have
- * delivered stays unseen. The session's own replies are added at completion. */
-function noteTurnAcceptance(event: RuntimeEvent): void {
-  const pending = pendingHandoffs.get(event.threadId);
-  if (!pending || event.providerInstanceId !== pending.instanceId) return;
-  if (pending.turnId && event.turnId && event.turnId !== pending.turnId) return;
-  if (event.type === "session.started") {
-    // Another session carries this turn: the driver sent it the recovery
-    // rebuild, which replays the transcript window but not the unseen block.
-    if (pending.resumeCursor !== undefined && event.sessionId && event.sessionId !== pending.resumeCursor) {
-      pending.placed = pending.placed.filter((id) => pending.recoveryWindow.has(id));
-    }
-    return;
-  }
-  const acted = event.type === "content.delta" || event.type === "item.started" || event.type === "item.updated" ||
-    event.type === "item.completed" || event.type === "request.opened" || (event.type === "turn.completed" && event.ok);
-  if (acted && !pending.accepted) {
-    pending.accepted = true;
-    pending.turnId ??= event.turnId;
-    recordHandoff(event.threadId, pending, [...pending.placed, ...pending.carried]);
-  }
-  if (event.type !== "turn.completed") return;
-  pendingHandoffs.delete(event.threadId);
-  if (!pending.accepted) return;
-  const turnId = event.turnId ?? pending.turnId;
-  recordHandoff(event.threadId, pending, store.activePath(event.threadId)
-    .filter((m) => m.role === "bot" && m.kind === "text" && !m.from && turnId !== undefined && m.turnId === turnId)
-    .map((m) => m.id));
-}
+const handoffs = new Handoffs({
+  order: (threadId) => store.activePath(threadId).filter(isContextMessage).map((m) => m.id),
+  read: (botId, threadId, instanceId) => store.taskByThread(botId, threadId)?.handedMessages?.[instanceId],
+  write: (botId, threadId, instanceId, state) => store.setHandedMessages(botId, threadId, instanceId, state),
+  replies: (threadId, turnId) => store.activePath(threadId)
+    .filter((m) => m.role === "bot" && m.kind === "text" && !m.from && m.turnId === turnId).map((m) => m.id),
+});
 
 /** Consume one delegated-turn watch and mirror exactly one terminal state.
  * Some harness paths settle a busy bot without a provider turn.completed
@@ -5389,16 +5336,24 @@ async function startTurn(
     !rewound &&
     !externalContextMarker &&
     engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
-  // An engine that records what its session received resumes it with only
-  // the context messages outside that record. A record that no longer lines
-  // up with the branch cannot be trusted: replay instead.
+  // An engine that records what its session was handed resumes it with only
+  // the context messages outside that record. A record of another session
+  // (the one it replaced) or one that no longer lines up with the branch is
+  // not trusted: the session is rebuilt by the same replay as any other.
   const strictResume = instance.adapter.capabilities.strictResume === true;
-  const resumable = strictResume && !rewound && !fresh && !externalContextMarker && task.resumeCursors[instanceId] !== undefined;
-  const handed = resumable ? task.handedMessages?.[instanceId] : undefined;
-  const handedStale = Boolean(handed && !handedStateUsable(handed, contextOrder));
-  const { block: unseenBlock, placed } = handed && !handedStale
-    ? renderUnseen(unseenMessages(replayable, contextOrder, handed))
-    : { block: "", placed: [] };
+  const cursor = task.resumeCursors[instanceId];
+  const handed = strictResume && !rewound && !fresh && !externalContextMarker && cursor !== undefined
+    ? task.handedMessages?.[instanceId] : undefined;
+  const unseen = handed && handedStateUsable(handed, cursor, contextOrder) ? unseenMessages(replayable, contextOrder, handed) : undefined;
+  // What shapes a session from its launch. An update from outside it (a
+  // teammate's result or reply) that finds this changed — a new soul, say —
+  // gets the fresh session and replay it always got, rather than a resume.
+  const sessionConfig = createHash("sha256").update(JSON.stringify([
+    bot.name, bot.title, bot.description, bot.soul, sectionContextSystemPrompt(bot.section), instanceId, model, effort,
+  ])).digest("hex").slice(0, 16);
+  const handedStale = Boolean(handed && (!unseen ||
+    (handed.config !== sessionConfig && (opts?.coordination?.resumed || unseen.some((m) => m.keep)))));
+  const { block: unseenBlock, placed } = unseen && !handedStale ? renderUnseen(unseen) : { block: "", placed: [] };
   // Agent-tool gate shared by skill authoring, the /setup turn-text rewrite,
   // the setup prompt block, and the peer-comms integration below: a driver
   // that never mounts agent tools (or a turn already at the comms-depth cap)
@@ -5435,15 +5390,17 @@ async function startTurn(
   // driver may fall back to ONE fresh session, and this is what it sends
   // there, so the new session is not blank (server/resume-recovery.ts).
   const recoveryText = resumeCursor !== undefined ? buildRecoveryText({ text: userTurnText, transcript }) : undefined;
-  // What this turn puts in front of the provider, recorded once the provider
-  // is seen acting on it (see noteTurnAcceptance). A turn that rebuilds the
-  // session hands everything up to the branch's last message.
-  const handoff: PendingHandoff | undefined = strictResume ? {
-    botId: bot.id, instanceId, resumeCursor,
-    replace: !handed || handedStale, through: contextOrder.at(-1),
-    placed, carried: [...skipTranscript],
-    recoveryWindow: new Set(replayable.slice(-40).map((m) => m.id)),
-    accepted: false,
+  // What this turn puts in front of the provider, for each session it can end
+  // up in (server/delta-context.ts). buildTurnContext prepends a replay only
+  // when it replays, so a changed text means the transcript was sent.
+  const carried = [...skipTranscript];
+  const windowIds = replayable.slice(-40).map((m) => m.id);
+  const handoff: Handoff | undefined = strictResume ? {
+    botId: bot.id, instanceId, config: sessionConfig, ...(typeof resumeCursor === "string" ? { resumeCursor } : {}),
+    started: sessionStart(contextOrder, contextTurnText !== userTurnText ? windowIds : [], carried),
+    rebuilt: sessionStart(contextOrder, recoveryText !== undefined ? windowIds : [], carried),
+    resumed: sessionStart(contextOrder, [], [...placed, ...carried]),
+    placed, carried, own: [userMessage.id, ...(opts?.excludeMessageIds ?? [])],
   } : undefined;
 
   const persona = [
@@ -5473,6 +5430,7 @@ async function startTurn(
   // follow-ups: any normal turn may ask teammates to coordinate work.
   directFollowupSettlers.set(dispatchClaimId, { threadId, settle: opts?.onTurnSettled });
   directTurnDispatchClaims.set(threadId, { id: dispatchClaimId, botId, threadId, phase: "setup" });
+  if (handoff) handoffs.begin(threadId, dispatchClaimId, handoff);
   directTurnBots.set(threadId, bot);
   beginInternalCapabilityGeneration(threadId, dispatchClaimId);
   store.setTaskActivity(bot.id, threadId, "working");
@@ -5935,7 +5893,7 @@ async function startTurn(
       ]);
       runningTurnEngines.set(threadId, instance);
       // Before sendTurn: an adapter may emit the whole turn before it resolves.
-      if (handoff) pendingHandoffs.set(threadId, { ...handoff, claimId: dispatchClaimId });
+      handoffs.dispatching(threadId, dispatchClaimId);
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
@@ -5964,8 +5922,7 @@ async function startTurn(
         throw new DirectTurnSetupCancelled("turn stopped during provider setup");
       }
       bindInternalCapabilityToProviderTurn(threadId, dispatchClaimId, dispatch.value.turnId);
-      const pendingHandoff = pendingHandoffs.get(threadId);
-      if (pendingHandoff?.claimId === dispatchClaimId) pendingHandoff.turnId ??= dispatch.value.turnId;
+      handoffs.bindTurn(threadId, dispatchClaimId, dispatch.value.turnId);
       if (directFollowupSettlers.has(dispatchClaimId) && dispatch.value.turnId &&
         !directFollowupTurns.bind(threadId, dispatchClaimId, dispatch.value.turnId)) {
         // This exact queued turn completed before its dispatch ACK arrived.
@@ -6009,7 +5966,7 @@ async function startTurn(
         drainDelegationWakes();
       }
     } catch (e) {
-      if (pendingHandoffs.get(threadId)?.claimId === dispatchClaimId) pendingHandoffs.delete(threadId);
+      handoffs.abandon(threadId, dispatchClaimId);
       settleDirectFollowup(dispatchClaimId);
       clearCancelledProviderHandshake(threadId, `direct:${dispatchClaimId}`);
       clearDirectTurnDispatch(threadId, dispatchClaimId);
@@ -14257,6 +14214,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             // message intact for the next ordinary turn, where central image
             // admission can hand it to the provider natively.
             const carriesImages = extractTurnImages(text).images.length > 0;
+            const steerTarget = handoffs.current(threadId);
             if (!carriesImages && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
               steered = await instance.adapter
                 .steer(threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
@@ -14297,12 +14255,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
                 sendId,
                 steered: true,
               });
-              // The running turn's session received it.
-              const steeredHandoff = pendingHandoffs.get(threadId);
-              if (steeredHandoff && steeredHandoff.instanceId === instance?.instanceId) {
-                if (steeredHandoff.accepted) recordHandoff(threadId, steeredHandoff, [message.id]);
-                else steeredHandoff.carried.push(message.id);
-              }
+              // Handed to the turn it went into once that turn shows output after it.
+              handoffs.steered(threadId, steerTarget, instance?.instanceId, message.id);
               return { ok: true as const, steered: true as const, threadId, message };
             }
             if (!current.busy) {
@@ -14536,7 +14490,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (typeof expectedThreadId === "string" && store.taskByThread(bot.id, expectedThreadId)) {
         const routine = routines!.activeBotRunForBot(bot.id);
         if (routine?.threadId === expectedThreadId) await routines!.cancelRun(routine.id);
-        else await interruptDirectThread(bot.id, expectedThreadId);
+        else {
+          handoffs.stoppedByPerson(expectedThreadId);
+          await interruptDirectThread(bot.id, expectedThreadId);
+        }
         return json(res, 200, { ok: true });
       }
       const directClaim = directTurnDispatchClaims.get(bot.threadId);
@@ -14574,6 +14531,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       ) {
         return json(res, 409, { error: "the bot switched tasks before it could be interrupted" });
       }
+      handoffs.stoppedByPerson(expectedThreadId ?? bot.threadId);
       await interruptDirectThread(bot.id, expectedThreadId ?? bot.threadId);
       return json(res, 200, { ok: true });
     }
@@ -16452,12 +16410,16 @@ for (const row of chatFollowups()) {
   if (!owned) { settleChatFollowups([row.id], "cancelled"); continue; }
   settleChatFollowups([row.id], "interrupted");
   const messages = store.messagesFor(row.threadId);
-  if (!messages.some((message) => message.queueId === row.id && message.role === "user")) {
-    store.appendMessage(row.threadId, {
-      role: "user", kind: "text", text: row.payload.text, replyToId: row.payload.replyToId,
-      sendId: row.payload.sendId, queueId: row.id,
-      ...(row.kind === "channel" ? { channelMode: row.payload.mode, via: row.payload.via } : {}),
-    });
+  const recovered = messages.find((message) => message.queueId === row.id && message.role === "user") ?? store.appendMessage(row.threadId, {
+    role: "user", kind: "text", text: row.payload.text, replyToId: row.payload.replyToId,
+    sendId: row.payload.sendId, queueId: row.id,
+    ...(row.kind === "channel" ? { channelMode: row.payload.mode, via: row.payload.via } : {}),
+  });
+  // Nor as a message a resumed session has not seen: count it as handed.
+  const recoveredTask = row.kind === "bot" ? store.taskByThread(row.ownerId, row.threadId) : undefined;
+  const order = store.activePath(row.threadId).filter(isContextMessage).map((m) => m.id);
+  for (const [instanceId, state] of Object.entries(recoveredTask?.handedMessages ?? {})) {
+    if (state.session !== undefined) store.setHandedMessages(row.ownerId, row.threadId, instanceId, recordHanded(state, order, [recovered.id]));
   }
   if (!messages.some((message) => message.queueId === row.id && message.kind === "activity")) {
     store.appendMessage(row.threadId, {

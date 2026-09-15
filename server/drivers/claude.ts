@@ -1542,12 +1542,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               break;
             }
             if (text.trim()) {
+              // The CLI's own report of any other API error is still shown,
+              // but marked: the model never produced it.
+              const synthetic = o.is_api_error_message === true || typeof o.error === "string" ? { synthetic: true } : {};
               // fallback delta for CLIs/paths that never streamed the block
               if (!session.turn?.sawStreamDelta) {
-                emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+                emit({ ...base(threadId, currentTurnId()), ...synthetic, type: "content.delta", streamKind: "assistant_text", delta: text });
               }
               if (session.turn) session.turn.sawStreamDelta = false;
-              emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
+              emit({ ...base(threadId, currentTurnId()), ...synthetic, type: "item.completed", itemType: "assistant_text", text });
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {

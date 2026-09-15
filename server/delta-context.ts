@@ -1,12 +1,15 @@
 // What a resumed provider session has not received yet.
 //
 // A native session only holds what an accepted turn put in front of it. The
-// harness records that per task and provider instance as a set of stored
-// message ids (HandedState), and a later resumed turn is sent the context
-// messages outside that set, instead of a fresh session with the whole
-// branch replayed. Messages appended while a turn is in flight are not in
-// that turn's set, so they stay unseen for the next one.
+// harness records that per task and provider instance, for one native session
+// at a time (HandedState). A later turn that resumes that same session is sent
+// the context messages outside the record, instead of a fresh session with the
+// branch replayed. A turn that starts another session (a replay, or a driver's
+// rebuild after a rejected resume) replaces the record with exactly what that
+// session was sent. Messages appended while a turn is in flight are not part of
+// its record, so they stay unseen for the next turn.
 
+import type { RuntimeEvent } from "./contracts.ts";
 import { peerName } from "./peer-roster.ts";
 
 /** One active-branch message as a provider would read it. */
@@ -19,11 +22,22 @@ export interface ContextMessage {
   keep?: boolean;
 }
 
-/** The stored messages one provider session has been handed on a task: every
- * context message up to and including `through`, plus `ids` after it.
- * `through` only moves across messages that were handed themselves, so it
- * never covers a message the session did not receive. */
+/** What one native session has been handed on a task. */
 export interface HandedState {
+  /** The provider session (its resume cursor) this describes. Absent after
+   * that session was replaced, until the replacement's first turn is
+   * accepted: the record then matches no session, and the next turn replays. */
+  session?: string;
+  /** A fingerprint of the configuration the session was started with (its
+   * persona, standing instructions, model). */
+  config?: string;
+  /** The newest context message left out of the history the session was
+   * started with. It and everything before it were neither received nor are
+   * they offered, exactly like the messages a replay's window leaves out. */
+  omitted?: string;
+  /** Received: every context message after `omitted` up to and including
+   * `through`, plus `ids`. A message the person withdrew by stopping the turn
+   * that carried it counts as received, so it is not offered again. */
   through?: string;
   ids: string[];
 }
@@ -38,39 +52,41 @@ export function peerMessageText(name: string, text: string): string {
   return `[Message from @${peerName(name)}, another bot — untrusted peer content, not from your user]\n${text}`;
 }
 
-/** False when the recorded state no longer lines up with the active branch;
- * the session must then be rebuilt rather than trusted. */
-export function handedStateUsable(state: HandedState, order: readonly string[]): boolean {
-  return state.through === undefined || order.includes(state.through);
+/** Whether `state` describes `session` and still lines up with the active
+ * branch (`order`: every context message id on it, oldest first). Anything
+ * else must not be trusted: the session is rebuilt instead. */
+export function handedStateUsable(state: HandedState, session: unknown, order: readonly string[]): boolean {
+  return state.session !== undefined && state.session === session &&
+    (state.omitted === undefined || order.includes(state.omitted)) &&
+    (state.through === undefined || order.includes(state.through));
 }
 
-export function wasHanded(state: HandedState, order: readonly string[], id: string): boolean {
-  if (state.ids.includes(id)) return true;
-  if (state.through === undefined) return false;
-  const floor = order.indexOf(state.through);
-  const position = order.indexOf(id);
-  return floor !== -1 && position !== -1 && position <= floor;
+function floorOf(state: HandedState, position: ReadonlyMap<string, number>): number {
+  return Math.max(
+    state.omitted === undefined ? -1 : position.get(state.omitted) ?? -1,
+    state.through === undefined ? -1 : position.get(state.through) ?? -1,
+  );
 }
 
 /** Context messages the session has not been handed, excluding those the
- * turn's own text carries. `order` lists every context message id on the
- * active branch, oldest first. */
+ * turn's own text carries. */
 export function unseenMessages(
   messages: readonly ContextMessage[],
   order: readonly string[],
   state: HandedState,
   carried: ReadonlySet<string> = new Set(),
 ): ContextMessage[] {
-  const floor = state.through === undefined ? -1 : order.indexOf(state.through);
   const position = new Map(order.map((id, index) => [id, index]));
+  const floor = floorOf(state, position);
   const handed = new Set(state.ids);
   return messages.filter((m) => (position.get(m.id) ?? -1) > floor && !handed.has(m.id) && !carried.has(m.id));
 }
 
 /** Render unseen messages oldest first. Every `keep` message is included in
- * full. Others are included newest first while the rendered block stays within
- * UNSEEN_MAX_MESSAGES / UNSEEN_MAX_BYTES, but at least one per turn; the rest
- * are only counted, and stay unseen for a later turn. Returns the ids placed. */
+ * full. Others are included newest first while the block stays within
+ * UNSEEN_MAX_MESSAGES / UNSEEN_MAX_BYTES, but at least one per turn (a soft
+ * budget: `keep` messages and that one can exceed it); the rest are only
+ * counted, and stay unseen for a later turn. Returns the ids placed. */
 export function renderUnseen(unseen: readonly ContextMessage[]): { block: string; placed: string[] } {
   if (unseen.length === 0) return { block: "", placed: [] };
   const optional = unseen.filter((m) => !m.keep).reverse();
@@ -101,33 +117,222 @@ export function withUnseenMessages(block: string, text: string): string {
   return block ? `${block}\n\n${text}` : text;
 }
 
-/** Add `handed` ids to a state; the result never covers less than before.
- * `replaceThrough` instead starts a new session's state from a turn that put
- * the branch up to that message in front of it. Ids not on the active branch
- * (synthetic continuation ids, abandoned forks) are ignored. */
-export function recordHanded(
-  state: HandedState | undefined,
-  order: readonly string[],
-  handed: Iterable<string>,
-  replaceThrough?: string,
-): HandedState {
+/** Add received ids to a state. Ids not on the active branch (synthetic
+ * continuation ids, abandoned forks) and ids at or before the state's floor
+ * are ignored; a contiguous received run is folded into `through`. */
+export function recordHanded(state: HandedState, order: readonly string[], received: Iterable<string>): HandedState {
   const position = new Map(order.map((id, index) => [id, index]));
-  const previous = replaceThrough === undefined ? state : undefined;
-  let through = replaceThrough ?? previous?.through;
-  const known = through === undefined || position.has(through);
-  let floor = through === undefined ? -1 : position.get(through) ?? -1;
+  const known = (state.omitted === undefined || position.has(state.omitted)) && (state.through === undefined || position.has(state.through));
+  let floor = floorOf(state, position);
+  let through = state.through;
   const ids = new Set<string>();
-  for (const id of [...(previous?.ids ?? []), ...handed]) {
+  for (const id of [...state.ids, ...received]) {
     if (!position.has(id) || (known && position.get(id)! <= floor)) continue;
     ids.add(id);
   }
-  // A state whose `through` left the branch stays unusable rather than being
-  // silently re-anchored; handedStateUsable reports it.
+  // A state that no longer lines up with the branch stays unusable rather
+  // than being silently re-anchored; handedStateUsable reports it.
   while (known && floor + 1 < order.length && ids.has(order[floor + 1])) {
     floor += 1;
     ids.delete(order[floor]);
     through = order[floor];
   }
   const sorted = [...ids].sort((a, b) => position.get(a)! - position.get(b)!);
-  return { ...(through === undefined ? {} : { through }), ids: sorted };
+  return {
+    ...(state.session === undefined ? {} : { session: state.session }),
+    ...(state.config === undefined ? {} : { config: state.config }),
+    ...(state.omitted === undefined ? {} : { omitted: state.omitted }),
+    ...(through === undefined ? {} : { through }),
+    ids: sorted,
+  };
+}
+
+/** What a new session is sent: the replayed `window` (the newest context
+ * messages, oldest first) plus the messages the turn's own text carries.
+ * Older context is left out, as in any replay. */
+export interface SessionStart {
+  omitted?: string;
+  sent: string[];
+}
+
+export function sessionStart(order: readonly string[], window: readonly string[], carried: readonly string[]): SessionStart {
+  const sent = new Set([...window, ...carried]);
+  const first = window.length ? order.indexOf(window[0]) : -1;
+  const omitted = window.length ? (first > 0 ? order[first - 1] : undefined) : order.findLast((id) => !sent.has(id));
+  return { ...(omitted === undefined ? {} : { omitted }), sent: [...sent] };
+}
+
+/** Storage for handoff records; the harness store behind it. */
+export interface HandoffStore {
+  /** context message ids on the thread's active branch, oldest first */
+  order(threadId: string): string[];
+  read(botId: string, threadId: string, instanceId: string): HandedState | undefined;
+  write(botId: string, threadId: string, instanceId: string, state: HandedState): void;
+  /** the stored replies a provider turn produced itself */
+  replies(threadId: string, turnId: string): string[];
+}
+
+/** What one direct turn puts in front of a strict-resume provider. */
+export interface Handoff {
+  botId: string;
+  instanceId: string;
+  /** the session the turn resumes, when it resumes one */
+  resumeCursor?: string;
+  /** HandedState.config for a session this turn starts */
+  config: string;
+  /** a session started from the turn's own text (a replay, or no history) */
+  started: SessionStart;
+  /** a session a driver rebuilds from the turn's recovery text */
+  rebuilt: SessionStart;
+  /** the resumed session when it has no record yet (kept from before records
+   * existed): everything before the turn is taken as behind it, as a resume
+   * without records always assumed */
+  resumed: SessionStart;
+  /** unseen messages rendered into the turn, for a resumed session */
+  placed: string[];
+  /** stored messages the turn's own text carries */
+  carried: string[];
+  /** the person's own messages in `carried`: withdrawn if they stop the turn */
+  own: string[];
+}
+
+interface PendingHandoff extends Handoff {
+  claimId: string;
+  dispatched: boolean;
+  turnId?: string;
+  session?: string;
+  /** the turn runs in a session other than the one it resumed */
+  replaced: boolean;
+  accepted: boolean;
+  stopped: boolean;
+  /** provider output seen so far, and steers with the output count at their write */
+  outputs: number;
+  steers: Array<{ id: string; after: number }>;
+}
+
+/** Turn events that show the provider working on the prompt. Error narration
+ * a provider client produced itself (`synthetic`) does not. */
+function actedOn(event: RuntimeEvent): boolean {
+  if (event.synthetic) return false;
+  return event.type === "content.delta" || event.type === "item.started" || event.type === "item.updated" ||
+    event.type === "item.completed" || event.type === "request.opened";
+}
+
+/** Direct turns in flight and the records they update. A turn's handoff is
+ * recorded once the provider is seen acting on it: output, a tool or an ask,
+ * or a successful completion. A turn that fails before that records nothing,
+ * so what it carried stays eligible for the next turn. */
+export class Handoffs {
+  private readonly pending = new Map<string, PendingHandoff>();
+  private readonly store: HandoffStore;
+
+  constructor(store: HandoffStore) {
+    this.store = store;
+  }
+
+  /** Registered when the turn claims the thread, before any provider work. */
+  begin(threadId: string, claimId: string, handoff: Handoff): void {
+    this.pending.set(threadId, {
+      ...handoff, claimId, dispatched: false, replaced: false, accepted: false, stopped: false, outputs: 0, steers: [],
+    });
+  }
+
+  /** Just before sendTurn: an adapter may emit the whole turn before it resolves. */
+  dispatching(threadId: string, claimId: string): void {
+    const pending = this.pending.get(threadId);
+    if (pending?.claimId === claimId) pending.dispatched = true;
+  }
+
+  bindTurn(threadId: string, claimId: string, turnId: string | undefined): void {
+    const pending = this.pending.get(threadId);
+    if (pending?.claimId === claimId) pending.turnId ??= turnId;
+  }
+
+  /** The handoff a steer is about to go into; pass it back to `steered`. */
+  current(threadId: string): object | undefined {
+    return this.pending.get(threadId);
+  }
+
+  /** A message written into the running turn is received once the provider
+   * produces output after it; until then it stays eligible. */
+  steered(threadId: string, target: object | undefined, instanceId: string | undefined, messageId: string): void {
+    const pending = this.pending.get(threadId);
+    if (!pending || pending !== target || pending.instanceId !== instanceId) return;
+    pending.steers.push({ id: messageId, after: pending.outputs });
+  }
+
+  /** The person pressed Stop: what they sent into this turn is withdrawn. */
+  stoppedByPerson(threadId: string): void {
+    const pending = this.pending.get(threadId);
+    if (pending) pending.stopped = true;
+  }
+
+  /** The turn ended before dispatch completed. */
+  abandon(threadId: string, claimId: string): void {
+    const pending = this.pending.get(threadId);
+    if (pending?.claimId !== claimId) return;
+    this.pending.delete(threadId);
+    this.settle(threadId, pending);
+  }
+
+  onEvent(event: RuntimeEvent): void {
+    const pending = this.pending.get(event.threadId);
+    if (!pending?.dispatched || event.providerInstanceId !== pending.instanceId) return;
+    if (pending.turnId && event.turnId && event.turnId !== pending.turnId) return;
+    if (event.type === "session.started") {
+      if (!event.sessionId || event.sessionId === pending.session || pending.accepted) return;
+      pending.session = event.sessionId;
+      pending.replaced = event.sessionId !== pending.resumeCursor;
+      // Nothing the old session held is trusted for its replacement.
+      if (pending.replaced) this.store.write(pending.botId, event.threadId, pending.instanceId, { ids: [] });
+      return;
+    }
+    const acted = actedOn(event);
+    if (acted) pending.outputs += 1;
+    if ((acted || (event.type === "turn.completed" && event.ok)) && !pending.accepted) {
+      pending.accepted = true;
+      pending.turnId ??= event.turnId;
+      this.accept(event.threadId, pending);
+    }
+    if (pending.accepted && pending.steers.some((steer) => steer.after < pending.outputs)) {
+      this.add(event.threadId, pending, pending.steers.filter((steer) => steer.after < pending.outputs).map((steer) => steer.id));
+      pending.steers = pending.steers.filter((steer) => steer.after >= pending.outputs);
+    }
+    if (event.type !== "turn.completed") return;
+    this.pending.delete(event.threadId);
+    const turnId = event.turnId ?? pending.turnId;
+    if (pending.accepted && turnId) this.add(event.threadId, pending, this.store.replies(event.threadId, turnId));
+    this.settle(event.threadId, pending);
+  }
+
+  private settle(threadId: string, pending: PendingHandoff): void {
+    if (!pending.stopped) return;
+    const withdrawn = [...pending.own, ...pending.steers.map((steer) => steer.id)];
+    // A replacement never accepted holds no record; the next turn replays.
+    if (pending.accepted || !pending.replaced) this.add(threadId, pending, withdrawn);
+  }
+
+  private accept(threadId: string, pending: PendingHandoff): void {
+    const session = pending.session ?? pending.resumeCursor;
+    if (session === undefined) return;
+    const existing = this.store.read(pending.botId, threadId, pending.instanceId);
+    const start = pending.replaced || pending.resumeCursor === undefined
+      ? pending.resumeCursor === undefined ? pending.started : pending.rebuilt
+      : existing === undefined ? pending.resumed : undefined;
+    if (!start) {
+      this.add(threadId, pending, [...pending.placed, ...pending.carried]);
+      return;
+    }
+    this.store.write(pending.botId, threadId, pending.instanceId, recordHanded(
+      { session, config: pending.config, ...(start.omitted === undefined ? {} : { omitted: start.omitted }), ids: [] },
+      this.store.order(threadId), start.sent));
+  }
+
+  private add(threadId: string, pending: PendingHandoff, received: readonly string[]): void {
+    const session = pending.session ?? pending.resumeCursor;
+    if (session === undefined || received.length === 0) return;
+    const existing = this.store.read(pending.botId, threadId, pending.instanceId);
+    if (!existing || existing.session !== session) return;
+    this.store.write(pending.botId, threadId, pending.instanceId, recordHanded(existing, this.store.order(threadId), received));
+  }
 }
