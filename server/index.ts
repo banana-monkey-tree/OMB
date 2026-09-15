@@ -237,6 +237,7 @@ import {
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
 import { buildRecoveryText, buildTurnContext, engineIsFresh, peerMessageText } from "./turn-context.ts";
+import { Handoffs, handedStateUsable, recordHanded, renderUnseen, sessionStart, unseenMessages, withUnseenMessages, type ContextMessage } from "./delta-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnResources, workspaceResource, type TurnOwner } from "./turn-resources.ts";
@@ -1605,7 +1606,7 @@ if (browserCleanupReferencesReconciled) browserCleanup.startPending();
  * than the desktop window did. Stripped here rather than at each call site
  * so a new broadcast cannot forget. */
 let activeCoordinationForThread = (_threadId: string): boolean => false;
-const wireTask = ({ resumeCursors: _resumeCursors, lastInstanceId: _lastInstanceId, ...task }: TaskRecord) =>
+const wireTask = ({ resumeCursors: _resumeCursors, lastInstanceId: _lastInstanceId, handedMessages: _handedMessages, ...task }: TaskRecord) =>
   activeCoordinationForThread(task.threadId) && !task.busy ? { ...task, busy: true, activity: "working" as const } : task;
 
 const wireBot = (bot: NonNullable<ReturnType<typeof store.bot>>) => {
@@ -4125,6 +4126,7 @@ bus.subscribe((event: RuntimeEvent) => {
     pushMessage({ role: "bot", kind: "text", text: coordinatorVisibleText, turnId: completedTurnId });
     lastReply.set(event.threadId, coordinatorVisibleText);
   }
+  if (bot) handoffs.onEvent(event);
 
   switch (event.type) {
     case "session.started":
@@ -4735,12 +4737,38 @@ function isExternalContextMarker(value: string | undefined): boolean {
 function markTaskContextExternallyUpdated(bot: BotRecord, threadId: string): void {
   const task = store.taskByThread(bot.id, threadId);
   if (!task) return;
+  // An engine that records which messages its current session was handed
+  // keeps that session: its next turn is sent what it has not seen. Without a
+  // record for that exact session (another engine, one switched in since, a
+  // replaced session, or a task from before records existed) the next turn
+  // replays once, as before.
+  const owner = task.lastInstanceId;
+  const record = owner ? task.handedMessages?.[owner] : undefined;
+  if (owner && record?.session !== undefined && record.session === task.resumeCursors[owner] &&
+    turnInstance(botForThread(bot.id, threadId) ?? bot, undefined, threadId)?.instanceId === owner &&
+    registry.get(owner)?.adapter.capabilities.strictResume) {
+    store.patchTask(bot.id, threadId, { unread: true });
+    return;
+  }
   store.patchTask(bot.id, threadId, {
     resumeCursors: {},
     lastInstanceId: `${EXTERNAL_CONTEXT_MARKER_PREFIX}${randomUUID()}`,
     unread: true,
   });
 }
+
+/** Active-branch messages a provider reads as conversation context. */
+function isContextMessage(m: Message): boolean {
+  return Boolean((m.kind === "text" && m.text) || m.roomRequest?.phase === "result");
+}
+
+const handoffs = new Handoffs({
+  order: (threadId) => store.activePath(threadId).filter(isContextMessage).map((m) => m.id),
+  read: (botId, threadId, instanceId) => store.taskByThread(botId, threadId)?.handedMessages?.[instanceId],
+  write: (botId, threadId, instanceId, state) => store.setHandedMessages(botId, threadId, instanceId, state),
+  replies: (threadId, turnId) => store.activePath(threadId)
+    .filter((m) => m.role === "bot" && m.kind === "text" && !m.from && m.turnId === turnId).map((m) => m.id),
+});
 
 /** Consume one delegated-turn watch and mirror exactly one terminal state.
  * Some harness paths settle a busy bot without a provider turn.completed
@@ -5497,15 +5525,18 @@ async function startTurn(
   // Resolve its quote from full storage, while the replay itself remains
   // strictly limited to the selected branch below.
   const messagesById = new Map(store.messagesFor(threadId).map((message) => [message.id, message]));
-  const transcript = activeMessages
-    .filter((m) => ((m.kind === "text" && m.text) || m.roomRequest?.phase === "result") && !skipTranscript.has(m.id))
-    .slice(-40)
-    .map((m) => ({
-      role: m.role === "user" ? ("user" as const) : ("assistant" as const),
-      text: m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
-        : m.role !== "user" && m.from ? peerMessageText(m.from.name, transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"))
-        : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
-    }));
+  const context: ContextMessage[] = activeMessages.filter(isContextMessage).map((m) => ({
+    id: m.id,
+    role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+    text: m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
+      : m.role !== "user" && m.from ? peerMessageText(m.from.name, transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"))
+      : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
+    keep: m.roomRequest?.phase === "result" || (m.role !== "user" && Boolean(m.from)),
+    ...(m.steered ? { steered: true } : {}),
+  }));
+  const contextOrder = context.map((m) => m.id);
+  const replayable = context.filter((m) => !skipTranscript.has(m.id));
+  const transcript = replayable.slice(-40).map((m) => ({ role: m.role, text: m.text }));
 
   // After a rewind (edit / branch switch) the provider's native session
   // still contains the abandoned branch: start a fresh session instead of
@@ -5526,6 +5557,29 @@ async function startTurn(
     !rewound &&
     !externalContextMarker &&
     engineIsFresh({ instanceId, lastInstanceId: task.lastInstanceId, resumeCursors: task.resumeCursors, transcript });
+  // An engine that records what its session was handed resumes it with only
+  // the context messages outside that record. A record of another session
+  // (the one it replaced) or one that no longer lines up with the branch is
+  // not trusted: the session is rebuilt by the same replay as any other.
+  const strictResume = instance.adapter.capabilities.strictResume === true;
+  const cursor = task.resumeCursors[instanceId];
+  const handed = strictResume && !rewound && !fresh && !externalContextMarker && cursor !== undefined
+    ? task.handedMessages?.[instanceId] : undefined;
+  const unseen = handed && handedStateUsable(handed, cursor, contextOrder) ? unseenMessages(replayable, contextOrder, handed) : undefined;
+  // A teammate's result or reply: without records this turn would replay.
+  const externalUpdate = Boolean(opts?.coordination?.resumed || unseen?.some((m) => m.keep));
+  // What a resumed session keeps from its launch: the standing instructions
+  // (tools, servers and — for Claude — the model are passed on every launch),
+  // plus whatever this engine can only set when a session starts. Codex's
+  // thread/resume sends no model selection, and an effort it is not sent stays
+  // at the thread's last value, so both belong to the session there. An
+  // external update that finds any of it changed since the session started
+  // gets the fresh session and replay it always got, rather than a resume.
+  const persistentConfig = [bot.name, bot.title, bot.description, sectionContextSystemPrompt(bot.section),
+    ...(instance.driverKind === "codex" ? [model, effort ?? null] : [])];
+  const sessionConfig = (soul: string | undefined) =>
+    createHash("sha256").update(JSON.stringify([...persistentConfig, soul])).digest("hex").slice(0, 16);
+  const plannedConfig = sessionConfig(bot.soul);
   // Agent-tool gate shared by skill authoring, the /setup turn-text rewrite,
   // the setup prompt block, and the peer-comms integration below: a driver
   // that never mounts agent tools (or a turn already at the comms-depth cap)
@@ -5539,27 +5593,54 @@ async function startTurn(
   // which also depends on the bot's soul/description — is decided below,
   // from the same bot snapshot the prompt's soul is built from.
   const setupText = agentsMounted ? expandSetupTurnText(providerText) : providerText;
-  const { turnText, resume } = buildTurnContext({
-    text: promptWithReply(
-      skillAuthoring ? expandLearnTurnText(setupText) : setupText,
-      opts?.replyTo,
-      cfg.profile?.name?.trim() || "User",
-    ),
-    transcript,
-    rewound,
-    fresh,
-    externallyUpdated: Boolean(externalContextMarker),
-    replaysNatively: instance.driverKind === "grok",
-  });
-  // Snapshot the cursor alongside the context decision. An external result
-  // can arrive during async computer/setup work and clear the task cursor;
-  // this already-built turn must either keep its old session or replay on the
-  // following turn, never start a blank session with no transcript.
-  const resumeCursor = resume ? task.resumeCursors[instanceId] : undefined;
-  // A cursor the provider no longer honours must not brick the thread: the
-  // driver may fall back to ONE fresh session, and this is what it sends
-  // there, so the new session is not blank (server/resume-recovery.ts).
-  const recoveryText = resumeCursor !== undefined ? buildRecoveryText({ text: turnText, transcript }) : undefined;
+  const userTurnText = promptWithReply(
+    skillAuthoring ? expandLearnTurnText(setupText) : setupText,
+    opts?.replyTo,
+    cfg.profile?.name?.trim() || "User",
+  );
+  // Decided again at dispatch when setup outlasted a soul edit (config).
+  const decideContext = (config: string) => {
+    const handedStale = Boolean(handed && (!unseen || (externalUpdate && handed.config !== config)));
+    const { block: unseenBlock, placed } = unseen && !handedStale ? renderUnseen(unseen) : { block: "", placed: [] };
+    const { turnText: contextTurnText, resume } = buildTurnContext({
+      text: userTurnText,
+      transcript,
+      rewound,
+      fresh,
+      externallyUpdated: Boolean(externalContextMarker) || handedStale,
+      replaysNatively: instance.driverKind === "grok",
+    });
+    // Snapshot the cursor alongside the context decision. An external result
+    // can arrive during async computer/setup work and clear the task cursor;
+    // this already-built turn must either keep its old session or replay on the
+    // following turn, never start a blank session with no transcript.
+    const resumeCursor = resume ? task.resumeCursors[instanceId] : undefined;
+    // A cursor the provider no longer honours must not brick the thread: the
+    // driver may fall back to ONE fresh session, and this is what it sends
+    // there, so the new session is not blank (server/resume-recovery.ts). A
+    // turn carrying an external update gets the replay it would have had.
+    const recoveryIsReplay = resumeCursor !== undefined && externalUpdate && transcript.length > 0;
+    const recoveryText = resumeCursor === undefined ? undefined : recoveryIsReplay
+      ? buildTurnContext({ text: userTurnText, transcript, rewound: false, fresh: false, externallyUpdated: true, replaysNatively: false }).turnText
+      : buildRecoveryText({ text: userTurnText, transcript });
+    // What this turn puts in front of the provider, for each session it can end
+    // up in (server/delta-context.ts). buildTurnContext prepends a replay only
+    // when it replays, so a changed text means the transcript was sent.
+    const carried = [...skipTranscript];
+    const windowIds = replayable.slice(-40).map((m) => m.id);
+    return {
+      turnText: withUnseenMessages(unseenBlock, contextTurnText),
+      resumeCursor, recoveryText, recoveryIsReplay,
+      handoff: strictResume ? {
+        botId: bot.id, instanceId, config, resumeCursor: typeof resumeCursor === "string" ? resumeCursor : undefined,
+        started: sessionStart(contextOrder, contextTurnText !== userTurnText ? windowIds : [], carried),
+        recovery: sessionStart(contextOrder, recoveryText !== undefined ? windowIds : [], carried),
+        resumed: sessionStart(contextOrder, [], [...placed, ...carried]),
+        placed, carried, own: [userMessage.id, ...(opts?.excludeMessageIds ?? [])],
+      } : undefined,
+    };
+  };
+  let dispatchContext = decideContext(plannedConfig);
 
   const persona = [
     `You are ${bot.name}, a personal bot in OpenMausBot.`,
@@ -5588,6 +5669,7 @@ async function startTurn(
   // follow-ups: any normal turn may ask teammates to coordinate work.
   directFollowupSettlers.set(dispatchClaimId, { threadId, settle: opts?.onTurnSettled });
   directTurnDispatchClaims.set(threadId, { id: dispatchClaimId, botId, threadId, phase: "setup" });
+  if (dispatchContext.handoff) handoffs.begin(threadId, dispatchClaimId, dispatchContext.handoff);
   directTurnBots.set(threadId, bot);
   beginInternalCapabilityGeneration(threadId, dispatchClaimId);
   if (!opts?.computerSelectionContinuation && !opts?.cardContinuation && !opts?.automationSource && !opts?.unattended &&
@@ -6115,10 +6197,16 @@ async function startTurn(
         { id: "mentions", label: "Mentions", text: boundedCoordination && tagged.length ? `The user named these existing teammates: ${tagged.map(b => `${peerName(b.name)} (${b.id})`).join(", ")}. Use coordinate_bots when their contribution is needed; do not substitute native helper agents for these bots.` : mentionPrompt(tagged) },
       ]);
       runningTurnEngines.set(threadId, instance);
+      // The prompt carries the soul as saved now. If it changed during setup,
+      // decide again from what is actually sent.
+      const dispatchedConfig = sessionConfig(liveBot?.soul ?? bot.soul);
+      if (strictResume && dispatchedConfig !== plannedConfig) dispatchContext = decideContext(dispatchedConfig);
+      // Before sendTurn: an adapter may emit the whole turn before it resolves.
+      handoffs.dispatching(threadId, dispatchClaimId, dispatchContext.handoff);
       const dispatch = await guardTurnDispatch(instance.adapter.sendTurn({
         threadId,
         botId: bot.id,
-        text: turnText,
+        text: dispatchContext.turnText,
         refreshSystemPrompt: true,
         images: turnImages,
         approvalMode: approvalModeForTurn(bot, commsDepth > 0),
@@ -6128,8 +6216,9 @@ async function startTurn(
         // a rewound thread never resumes the abandoned branch's session
         // the active task's own session — another task's cursor would
         // resume the wrong conversation and defeat the context bubble
-        resumeCursor,
-        ...(recoveryText !== undefined ? { recoveryText } : {}),
+        resumeCursor: dispatchContext.resumeCursor,
+        ...(dispatchContext.recoveryText !== undefined ? { recoveryText: dispatchContext.recoveryText } : {}),
+        ...(dispatchContext.recoveryIsReplay ? { recoveryIsReplay: true } : {}),
         transcript,
         system: prompt.text,
         systemStable: prompt.stable,
@@ -6145,6 +6234,7 @@ async function startTurn(
         throw new DirectTurnSetupCancelled("turn stopped during provider setup");
       }
       bindInternalCapabilityToProviderTurn(threadId, dispatchClaimId, dispatch.value.turnId);
+      handoffs.bindTurn(threadId, dispatchClaimId, dispatch.value.turnId);
       if (directFollowupSettlers.has(dispatchClaimId) && dispatch.value.turnId &&
         !directFollowupTurns.bind(threadId, dispatchClaimId, dispatch.value.turnId)) {
         // This exact queued turn completed before its dispatch ACK arrived.
@@ -6188,6 +6278,7 @@ async function startTurn(
         drainDelegationWakes();
       }
     } catch (e) {
+      handoffs.abandon(threadId, dispatchClaimId);
       if (computerSelectionTurns.get(threadId)?.generation === dispatchClaimId) computerSelectionTurns.delete(threadId);
       settleDirectFollowup(dispatchClaimId);
       clearCancelledProviderHandshake(threadId, `direct:${dispatchClaimId}`);
@@ -6507,6 +6598,7 @@ routines = new RoutineManager({
     const task = store.taskByThread(botId, threadId);
     if (task && !task.busy && !task.routineRunId && store.messagesFor(threadId).length === 0) {
       store.deleteTask(botId, threadId);
+      handoffs.forget(threadId);
     }
   },
   startTurn: (botId, threadId, prompt, runOn, triggerSource, onDispatchError) =>
@@ -14639,6 +14731,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             // message intact for the next ordinary turn, where central image
             // admission can hand it to the provider natively.
             const carriesImages = extractTurnImages(text).images.length > 0;
+            const steerTarget = handoffs.current(threadId);
             if (!carriesImages && !computerSelectionTurns.get(threadId)?.selected && instance?.adapter.capabilities.queueing && instance.adapter.steer) {
               steered = await instance.adapter
                 .steer(threadId, promptWithReply(text, replyTo, cfg.profile?.name?.trim() || "User"))
@@ -14679,6 +14772,8 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
                 sendId,
                 steered: true,
               });
+              // Offered to the next turn again unless the person stops this one.
+              handoffs.steered(threadId, steerTarget, instance?.instanceId, message.id);
               return { ok: true as const, steered: true as const, threadId, message };
             }
             if (!current.busy) {
@@ -14912,7 +15007,10 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       if (typeof expectedThreadId === "string" && store.taskByThread(bot.id, expectedThreadId)) {
         const routine = routines!.activeBotRunForBot(bot.id);
         if (routine?.threadId === expectedThreadId) await routines!.cancelRun(routine.id);
-        else await interruptDirectThread(bot.id, expectedThreadId);
+        else {
+          handoffs.stoppedByPerson(expectedThreadId);
+          await interruptDirectThread(bot.id, expectedThreadId);
+        }
         return json(res, 200, { ok: true });
       }
       const directClaim = directTurnDispatchClaims.get(bot.threadId);
@@ -14950,6 +15048,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       ) {
         return json(res, 409, { error: "the bot switched tasks before it could be interrupted" });
       }
+      handoffs.stoppedByPerson(expectedThreadId ?? bot.threadId);
       await interruptDirectThread(bot.id, expectedThreadId ?? bot.threadId);
       return json(res, 200, { ok: true });
     }
@@ -15145,6 +15244,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
       cancelTeamSetupResumesForThread(m[2]);
       const updated = store.deleteTask(m[1], m[2]);
       if (!updated) return json(res, 404, { error: "no such task" });
+      handoffs.forget(m[2]);
       settleDirectFollowup(directTurnGenerationByThread.get(m[2]));
       rejectDeletedThreadSkillStages(stagedSkillCleanups);
       const fresh = botWithThread(updated);
@@ -16897,12 +16997,16 @@ for (const row of chatFollowups()) {
   if (!owned) { settleChatFollowups([row.id], "cancelled"); continue; }
   settleChatFollowups([row.id], "interrupted");
   const messages = store.messagesFor(row.threadId);
-  if (!messages.some((message) => message.queueId === row.id && message.role === "user")) {
-    store.appendMessage(row.threadId, {
-      role: "user", kind: "text", text: row.payload.text, replyToId: row.payload.replyToId,
-      sendId: row.payload.sendId, queueId: row.id,
-      ...(row.kind === "channel" ? { channelMode: row.payload.mode, via: row.payload.via } : {}),
-    });
+  const recovered = messages.find((message) => message.queueId === row.id && message.role === "user") ?? store.appendMessage(row.threadId, {
+    role: "user", kind: "text", text: row.payload.text, replyToId: row.payload.replyToId,
+    sendId: row.payload.sendId, queueId: row.id,
+    ...(row.kind === "channel" ? { channelMode: row.payload.mode, via: row.payload.via } : {}),
+  });
+  // Nor as a message a resumed session has not seen: count it as handed.
+  const recoveredTask = row.kind === "bot" ? store.taskByThread(row.ownerId, row.threadId) : undefined;
+  const order = store.activePath(row.threadId).filter(isContextMessage).map((m) => m.id);
+  for (const [instanceId, state] of Object.entries(recoveredTask?.handedMessages ?? {})) {
+    if (state.session !== undefined) store.setHandedMessages(row.ownerId, row.threadId, instanceId, recordHanded(state, order, [recovered.id]));
   }
   if (!messages.some((message) => message.queueId === row.id && message.kind === "activity")) {
     store.appendMessage(row.threadId, {
