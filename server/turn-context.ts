@@ -1,9 +1,16 @@
-// Building the text a driver actually receives. Three situations force an
-// inline replay of the active branch: a rewind (the visible branch changed),
-// a fresh engine (this instance has no session here — the user switched the
-// bot's model mid-thread), and an update appended outside the provider's own
-// turn. The first two coincide today but are distinct markers on purpose:
-// rewound also invalidates OTHER instances' cursors, fresh does not.
+import { buildDeltaTurnText } from "./delta-context.ts";
+
+// Building the text a driver actually receives. Two situations force an
+// inline replay of the active branch: a rewind (the visible branch changed)
+// and a fresh engine (this instance has no session here — the user switched
+// the bot's model mid-thread, or a resume cursor was rejected at runtime).
+// `externallyUpdated` is a third, legacy trigger for the same replay, kept
+// for callers that still need "the session cannot be trusted at all, replay
+// everything" — but the U1 default path (server/index.ts, a delegated
+// result returning to its source 1:1 thread) no longer sets it. Instead it
+// resumes the native session and passes `deltaBlock`: unseen-since-last-
+// handed content computed by server/delta-context.ts, prepended ahead of
+// the turn's own text instead of replacing the session.
 export interface TurnContextInput {
   /** the user's new message */
   text: string;
@@ -13,12 +20,20 @@ export interface TurnContextInput {
   rewound: boolean;
   /** this driver instance has no session cursor for this thread */
   fresh: boolean;
-  /** a message was appended outside the provider's own turn (for example,
-   * a delegated teammate returned a result). Native resume state cannot
-   * contain it, so the active branch must be replayed once. */
+  /** legacy full-replay trigger — an update was appended outside the
+   * provider's own turn and the session must be treated as unusable. Not
+   * set by the delegated-result-return path any more (see U1 above); kept
+   * for any other caller and for this function's own generality. */
   externallyUpdated: boolean;
   /** transcript-replay drivers get history via SendTurnInput.transcript instead */
   replaysNatively: boolean;
+  /** U1: unseen-since-last-handed content for a RESUMED turn
+   * (server/delta-context.ts's renderDeltaBlock). Ignored unless the turn
+   * actually resumes — a rewound/fresh/externallyUpdated turn gets the full
+   * inline replay instead, which already carries everything a delta would
+   * have. "" (or omitted) is a no-op, so an ordinary resumed turn with
+   * nothing unseen is byte-identical to before this field existed. */
+  deltaBlock?: string;
 }
 
 /** Does this engine need the thread replayed to it? True when a DIFFERENT
@@ -78,20 +93,22 @@ export function buildTurnContext(input: TurnContextInput): {
   /** false when the native session must not be resumed */
   resume: boolean;
 } {
-  const { text, transcript, rewound, fresh, externallyUpdated, replaysNatively } = input;
+  const { text, transcript, rewound, fresh, externallyUpdated, replaysNatively, deltaBlock } = input;
   const resume = !rewound && !fresh && !externallyUpdated;
   const replay = !resume && !replaysNatively && transcript.length > 0;
-  if (!replay) return { turnText: text, resume };
-  return {
-    turnText: [
-      rewound ? REWOUND_PREAMBLE : externallyUpdated ? EXTERNAL_UPDATE_PREAMBLE : FRESH_PREAMBLE,
-      "",
-      ...transcript.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`),
-      "",
-      "[Now reply to the user's latest message:]",
-      "",
-      text,
-    ].join("\n"),
-    resume,
-  };
+  if (replay) {
+    return {
+      turnText: [
+        rewound ? REWOUND_PREAMBLE : externallyUpdated ? EXTERNAL_UPDATE_PREAMBLE : FRESH_PREAMBLE,
+        "",
+        ...transcript.map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.text}`),
+        "",
+        "[Now reply to the user's latest message:]",
+        "",
+        text,
+      ].join("\n"),
+      resume,
+    };
+  }
+  return { turnText: deltaBlock ? buildDeltaTurnText(text, deltaBlock) : text, resume };
 }
