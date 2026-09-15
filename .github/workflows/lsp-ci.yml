@@ -1,0 +1,241 @@
+name: lsp CI
+
+# Fork-only workflow (banana-monkey-tree/OMB). Never sent upstream.
+#
+# Branch model: `main` mirrors upstream and never runs this; `lsp/v<tag>`
+# branches carry our patch stack; `v<upstream>-lsp.<n>` tags are our releases.
+# Upstream's own workflows stay disabled on the fork and are never edited here.
+#
+#   push lsp/**          -> typecheck + tests (arm64) + OSS npm tarball (artifact)
+#   push v*-lsp.* tag    -> the same, then a GitHub release on the fork with
+#                           openmausbot-<version>.tgz + SHA256SUMS
+on:
+  push:
+    branches: ["lsp/**"]
+    tags: ["v*-lsp.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lsp-ci-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  test:
+    name: typecheck + test (ubuntu-24.04-arm)
+    runs-on: ubuntu-24.04-arm
+    # vitest runs with fileParallelism:false; ~10.5 min on a 6-CPU arm64 VM.
+    timeout-minutes: 50
+    env:
+      # Tests excluded on arm64 CI. One per line: `<plan item> | <file> | <exact test title>`
+      # (*.node-test.mjs rows go to node's test runner, everything else to vitest).
+      # Lines starting with # are comments. Every entry names the plan item that
+      # removes it; the "excluded tests (report only)" step still runs them so
+      # their state stays visible in every run. Keep this list short.
+      LSP_CI_EXCLUDED_TESTS: |
+        # "Unsupported desktop browser target: linux-arm64": the pinned agent-browser/CfT bundle has no linux-arm64 target
+        U18 | scripts/prepare-browser.test.mjs | accepts only explicit and unambiguous CLI modes
+        U18 | server/browser-engine.test.ts | mounts the bundled browser with no download and keeps explicit Chrome overrides
+        # order/load-dependent under the full suite, passes alone
+        U33 | server/index.test.ts | team import is additive-only: smuggled grants, claimed ids, and re-imports never touch existing records
+        # race: the replacement AppImage can still see the Electron parent pid alive (parentAlive: true) under load
+        U38 | electron/vendor-updater.node-test.mjs | Electron relaunch waits for deferred cleanup and the replacement acquires the same data directory
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install Electron runtime libraries + Xvfb
+        # Same set omb-dev needed on Ubuntu 24.04 arm64 (plan T11).
+        run: >-
+          sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+          libatk1.0-0t64 libatk-bridge2.0-0t64 libgtk-3-0t64 libnss3 libgbm1 libasound2t64
+          libxss1 libxtst6 libdrm2 xvfb xauth
+      - run: pnpm install --frozen-lockfile
+      - name: Prepare Electron test runtime
+        run: node --input-type=commonjs -e "require('electron')"
+      - name: Guard against upstream changing the `test` script
+        # The steps below run `pnpm test`'s parts individually so vitest can take
+        # the exclusion filter. If upstream changes the script, fail loudly.
+        run: |
+          check() {
+            actual="$(node -p "require('./package.json').scripts['$1']")"
+            if [ "$actual" != "$2" ]; then
+              echo "::error::package.json scripts.$1 changed upstream: '$actual' — update lsp-ci.yml"
+              exit 1
+            fi
+          }
+          check test 'vitest run && pnpm broker:test && pnpm test:electron && pnpm test:packaged-server'
+          check test:electron 'node --test "electron/*.node-test.mjs"'
+      - run: pnpm typecheck
+      - name: Build exclusion filters
+        run: |
+          node --input-type=module -e '
+            import { appendFileSync } from "node:fs";
+            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const rows = process.env.LSP_CI_EXCLUDED_TESTS.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+            const parsed = rows.map((l) => { const [item, file, ...title] = l.split(" | "); return { item, file, title: title.join(" | ") }; });
+            for (const r of parsed) if (!r.item || !r.file || !r.title) throw new Error(`bad exclusion row: ${JSON.stringify(r)}`);
+            for (const r of parsed) console.log(`::warning title=excluded test (${r.item})::${r.file} > ${r.title}`);
+            const env = (k, v) => appendFileSync(process.env.GITHUB_ENV, `${k}=${v}\n`);
+            const vitest = parsed.filter((r) => !r.file.endsWith(".node-test.mjs"));
+            const node = parsed.filter((r) => r.file.endsWith(".node-test.mjs"));
+            if (vitest.length) {
+              const alt = vitest.map((r) => esc(r.title)).join("|");
+              env("LSP_CI_EXCLUDE_RE", `^(?!.*(?:${alt})).*$`);
+              env("LSP_CI_ONLY_RE", `(?:${alt})`);
+              env("LSP_CI_EXCLUDED_FILES", [...new Set(vitest.map((r) => r.file))].join(" "));
+            }
+            if (node.length) {
+              env("LSP_CI_NODE_SKIP_RE", `^(?:${node.map((r) => esc(r.title)).join("|")})$`);
+              env("LSP_CI_NODE_FILES", [...new Set(node.map((r) => r.file))].join(" "));
+            }
+          '
+      - name: Run tests (vitest, minus the exclusion list)
+        run: xvfb-run -a pnpm exec vitest run ${LSP_CI_EXCLUDE_RE:+-t "$LSP_CI_EXCLUDE_RE"}
+      - run: pnpm broker:test
+      - name: Run pnpm test:electron (minus the exclusion list)
+        # The fixtures spawn their own xvfb-run when it is installed.
+        # node --test failures produce no annotations; surface the failing titles.
+        run: |
+          set -o pipefail
+          node --test ${LSP_CI_NODE_SKIP_RE:+"--test-skip-pattern=$LSP_CI_NODE_SKIP_RE"} "electron/*.node-test.mjs" 2>&1 | tee "$RUNNER_TEMP/electron.log" || {
+            grep -E '^✖ ' "$RUNNER_TEMP/electron.log" | sort -u | sed 's/^/::error title=test:electron::/'
+            exit 1
+          }
+      - run: pnpm test:packaged-server
+      - name: Excluded tests (report only, never gates)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          rc=0
+          if [ -n "${LSP_CI_EXCLUDED_FILES:-}" ]; then
+            # shellcheck disable=SC2086 # file list is intentionally word-split
+            xvfb-run -a pnpm exec vitest run $LSP_CI_EXCLUDED_FILES -t "$LSP_CI_ONLY_RE" || rc=1
+          fi
+          if [ -n "${LSP_CI_NODE_FILES:-}" ]; then
+            # shellcheck disable=SC2086
+            node --test "--test-name-pattern=$LSP_CI_NODE_SKIP_RE" $LSP_CI_NODE_FILES 2>&1 | tee "$RUNNER_TEMP/excluded-node.log" || {
+              rc=1; grep -E '^✖ ' "$RUNNER_TEMP/excluded-node.log" | sort -u | sed 's/^/::warning title=excluded node test::/'
+            }
+          fi
+          exit $rc
+
+  package:
+    name: OSS npm tarball (enterprise/ removed)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ff378ebe6b225b0680b81c1ad4498ae0d1d3a5e3 # v6.0.10
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        env:
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      - name: Resolve the package version
+        # Tag v0.1.80-lsp.3 -> 0.1.80-lsp.3 (must sit on upstream's 0.1.80).
+        # Branch builds -> <upstream>-lsp.dev.g<sha7>.
+        run: |
+          base="$(node -p 'require("./package.json").version')"
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+            case "$version" in
+              "$base"-lsp.[0-9]*) ;;
+              *) echo "::error::tag $GITHUB_REF_NAME does not match package.json version $base (want v$base-lsp.<n>)"; exit 1 ;;
+            esac
+          else
+            version="$base-lsp.dev.g${GITHUB_SHA:0:7}"
+          fi
+          echo "LSP_VERSION=$version" >> "$GITHUB_ENV"
+          echo "version: $version"
+      - name: Delete the enterprise folder (open-source edition, see LICENSING.md)
+        run: rm -rf enterprise
+      - name: Build the server bundle, UI and npm package
+        run: pnpm build:server && pnpm exec vite build && node scripts/build-npm-package.mjs
+      - name: Stamp version and pack
+        run: |
+          set -euo pipefail
+          test ! -e dist-server/enterprise
+          cd release/npm
+          node --input-type=module -e '
+            import { readFileSync, writeFileSync } from "node:fs";
+            const pkg = JSON.parse(readFileSync("package.json", "utf8"));
+            pkg.version = process.env.LSP_VERSION;
+            pkg.files = pkg.files.filter((f) => f !== "enterprise");
+            writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          npm pack --silent
+          test -f "openmausbot-$LSP_VERSION.tgz"
+      - name: Prove the tarball is the open-source edition and runs standalone
+        run: |
+          set -euo pipefail
+          tgz="$PWD/release/npm/openmausbot-$LSP_VERSION.tgz"
+          if tar -tzf "$tgz" | grep -Ei '(^|/)enterprise(/|$)'; then
+            echo "::error::tarball contains enterprise/ paths"; exit 1
+          fi
+          fixture="$RUNNER_TEMP/omb-pack"
+          rm -rf "$fixture" && mkdir -p "$fixture/home" && tar -xzf "$tgz" -C "$fixture"
+          cd "$fixture/package"
+          set -x
+          trap 'echo "--- serve.log"; cat serve.log 2>/dev/null' ERR
+          test ! -d node_modules && test ! -e enterprise
+          test "$(node -p 'require("./package.json").version')" = "$LSP_VERSION"
+          node cli.js --help | grep -q "openmausbot serve"
+          HOME="$fixture/home" OMB_LICENSE_KEY=omb1.not.real node cli.js serve --no-pair --no-open --port 18799 --data-dir "$fixture/data" > serve.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:18799/api/health >/dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:18799/api/edition | tee edition.json; echo
+          grep -q '"edition":"oss"' edition.json
+          kill %1; wait %1 || true
+      - name: Checksums
+        run: |
+          cd release/npm
+          sha256sum "openmausbot-$LSP_VERSION.tgz" | tee SHA256SUMS
+          ls -l "openmausbot-$LSP_VERSION.tgz"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: openmausbot-npm
+          path: |
+            release/npm/openmausbot-*.tgz
+            release/npm/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: GitHub release (v*-lsp.* tags)
+    needs: [test, package]
+    if: startsWith(github.ref, 'refs/tags/v') && contains(github.ref_name, '-lsp.')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: openmausbot-npm
+          path: release/npm
+      - name: Verify checksums
+        run: cd release/npm && sha256sum -c SHA256SUMS
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          files=(release/npm/openmausbot-*.tgz release/npm/SHA256SUMS)
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            printf 'OpenMausBot open-source edition (enterprise/ removed), built from %s by lsp-ci.yml.\n\nNot an official OpenMausBot release. Verify with `sha256sum -c SHA256SUMS`.\n' "$GITHUB_SHA" > "$RUNNER_TEMP/notes.md"
+            gh release create "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" \
+              --verify-tag --title "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+          fi
