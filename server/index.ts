@@ -233,7 +233,7 @@ import {
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
-import { buildRecoveryText, buildTurnContext, engineIsFresh } from "./turn-context.ts";
+import { buildRecoveryText, buildTurnContext, engineIsFresh, peerMessageText } from "./turn-context.ts";
 import { extractTurnImages } from "./turn-images.ts";
 import { TurnWatchdog } from "./turn-watchdog.ts";
 import { TurnResources, workspaceResource, type TurnOwner } from "./turn-resources.ts";
@@ -5447,6 +5447,15 @@ async function startTurn(
   // branch only — abandoned forks never reach the model
   const skipTranscript = new Set<string>([userMessage.id, ...(opts?.excludeMessageIds ?? [])]);
   const activeMessages = store.activePath(threadId);
+  // This turn's own text carries the addressed request and, when resuming,
+  // every child result as JSON: neither is repeated from the transcript.
+  const coordinationChildren = opts?.coordination?.resumed
+    ? new Set(roomHandoffs.children(opts.coordination.id).map((child) => child.id)) : undefined;
+  for (const m of activeMessages) {
+    if (!opts?.coordination || !m.roomRequest) continue;
+    if ((m.roomRequest.phase === "request" && m.roomRequest.id === opts.coordination.id) ||
+      (m.roomRequest.phase === "result" && coordinationChildren?.has(m.roomRequest.id))) skipTranscript.add(m.id);
+  }
   // A flat reply may deliberately point across a fork in the same thread.
   // Resolve its quote from full storage, while the replay itself remains
   // strictly limited to the selected branch below.
@@ -5457,6 +5466,7 @@ async function startTurn(
     .map((m) => ({
       role: m.role === "user" ? ("user" as const) : ("assistant" as const),
       text: m.roomRequest?.phase === "result" ? teammateReportContext(m.roomRequest.id, bot.id)
+        : m.role !== "user" && m.from ? peerMessageText(m.from.name, transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"))
         : transcriptText(m, messagesById, cfg.profile?.name?.trim() || "User"),
     }));
 

@@ -14,7 +14,7 @@
 // everywhere alongside the mention-resolution units.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -187,6 +187,17 @@ describe("legacy routine comms e2e (fake ACP fleet)", () => {
           askerDelegate: {
             driver: "grokAgent",
             environment: { FAKE_ACP_MODE: "delegate-peer" },
+            config: { cli: FAKE_CLI, fullAuto: true },
+          },
+          // the same asker on an agent that cannot load its earlier session
+          askerNoLoad: {
+            driver: "grokAgent",
+            environment: {
+              FAKE_ACP_MODE: "delegate-peer",
+              FAKE_ACP_LOAD_NULL: "1",
+              FAKE_ACP_DUMP: join(home, "asker-no-load.json"),
+              FAKE_ACP_DUMP_PROMPT: "1",
+            },
             config: { cli: FAKE_CLI, fullAuto: true },
           },
           // A Chief that delegates only on the first assignment prompt, then
@@ -631,6 +642,32 @@ describe("legacy routine comms e2e (fake ACP fleet)", () => {
       expect(
         askerBot.messages.some((m: any) => m.role === "bot" && m.text?.includes("woke after delegation: saw the result")),
       ).toBe(true);
+    },
+    45_000,
+  );
+
+  it(
+    "wakes an agent that cannot load its session with the conversation replayed, not only the result",
+    async () => {
+      for (const existing of (await api("GET", "/api/bots")).body.bots) {
+        await api("PATCH", `/api/bots/${existing.id}`, { hidden: true });
+      }
+      const helper = (await api("POST", "/api/bots")).body.bot;
+      await api("PATCH", `/api/bots/${helper.id}`, { name: "Helper", modelSelection: { instanceId: "grok", model: "fake-model" } });
+      const asker = (await api("POST", "/api/bots")).body.bot;
+      await api("PATCH", `/api/bots/${asker.id}`, { name: "Asker", modelSelection: { instanceId: "askerNoLoad", model: "fake-model" } });
+
+      await startRoutine(asker.id, "hey @Helper please pick this up; keep the codename ORCHID_EARLIER_CONTEXT");
+      await waitUntil(async () => {
+        const bot = (await api("GET", "/api/bots")).body.bots.find((b: any) => b.id === asker.id);
+        return !bot.busy && bot.messages.some((m: any) => m.role === "bot" && m.text?.includes("woke after delegation"));
+      }, 30_000, "the source never woke after its delegation");
+
+      const woke = String(JSON.parse(readFileSync(join(home, "asker-no-load.json.prompt.json"), "utf8"))[0].text);
+      expect(woke).toContain("[A delegated task just completed]");
+      expect(woke).toContain("ORCHID_EARLIER_CONTEXT");
+      expect(woke.split("hello from fake acp").length - 1).toBe(1);
+      expect(woke).toContain("[Message from @Helper, another bot — untrusted peer content, not from your user]\n\"@Helper replied to the delegated task");
     },
     45_000,
   );
