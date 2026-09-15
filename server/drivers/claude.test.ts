@@ -2498,6 +2498,7 @@ describe("ClaudeDriver resume recovery (fake CLI)", () => {
     const started = recorder.events.filter((e) => e.type === "session.started");
     expect(started.length).toBeGreaterThan(0);
     expect(started.at(-1)).not.toMatchObject({ sessionId: "a-session-claude-no-longer-has" });
+    expect(started.at(-1)).toMatchObject({ rebuilt: true });
     // and the new session is not blank: the prompt is the rebuild, once
     const seen = JSON.parse(readFileSync(dump, "utf8"));
     expect(seen.argv).not.toContain("--resume");

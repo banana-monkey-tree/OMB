@@ -1047,7 +1047,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
     });
     // retry bookkeeping lives PER THREAD, not per sendTurn call: a relaunch
     // is a fresh sendTurn, and the attempt cap must survive across launches
-    const retryState = new Map<string, { attempt: number; cancelled: boolean }>();
+    const retryState = new Map<string, { attempt: number; cancelled: boolean; rebuilt?: boolean }>();
 
     const sendTurn = async (turn: SendTurnInput, logicalTurnId?: string) => {
       if (config.managed && (!turn.model || turn.model.includes("::") || !config.configDir ||
@@ -1085,7 +1085,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
       const retry = retryState.get(threadId) ?? { attempt: 0, cancelled: false };
       // A fresh user turn starts un-cancelled. A relaunch must keep a Stop
       // that landed while it was being scheduled.
-      if (!relaunch) retry.cancelled = false;
+      if (!relaunch) {
+        retry.cancelled = false;
+        retry.rebuilt = false;
+      }
       retryState.set(threadId, retry);
       // a retry relaunches the whole CLI; the backoff is scaled down in tests
       // so a fake's transient failures don't stall real seconds
@@ -1539,7 +1542,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               session.sawInit = true;
               session.nativePermissionMode = typeof o.permissionMode === "string" ? o.permissionMode : null;
               if (typeof o.session_id === "string") session.sessionId = o.session_id;
-              emit({ ...base(threadId, currentTurnId()), type: "session.started", sessionId: o.session_id, model: o.model });
+              emit({ ...base(threadId, currentTurnId()), type: "session.started", sessionId: o.session_id, model: o.model, ...(retry.rebuilt ? { rebuilt: true } : {}) });
             } else if (o.subtype === "thinking_tokens") {
               emit({ ...base(threadId, currentTurnId()), type: "item.updated", itemType: "reasoning", tokens: o.estimated_tokens });
             }
@@ -1573,12 +1576,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
               break;
             }
             if (text.trim()) {
+              // The CLI's own report of any other API error is still shown,
+              // but marked: the model never produced it.
+              const synthetic = o.is_api_error_message === true || typeof o.error === "string" ? { synthetic: true } : {};
               // fallback delta for CLIs/paths that never streamed the block
               if (!session.turn?.sawStreamDelta) {
-                emit({ ...base(threadId, currentTurnId()), type: "content.delta", streamKind: "assistant_text", delta: text });
+                emit({ ...base(threadId, currentTurnId()), ...synthetic, type: "content.delta", streamKind: "assistant_text", delta: text });
               }
               if (session.turn) session.turn.sawStreamDelta = false;
-              emit({ ...base(threadId, currentTurnId()), type: "item.completed", itemType: "assistant_text", text });
+              emit({ ...base(threadId, currentTurnId()), ...synthetic, type: "item.completed", itemType: "assistant_text", text });
             }
             for (const b of Array.isArray(msg.content) ? msg.content : []) {
               if (b.type === "tool_use") {
@@ -1808,6 +1814,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             sessions.delete(threadId);
             session.turn = null;
             // Same relaunch handle as the transient-retry path above.
+            retry.rebuilt = true;
             retryState.set(threadId, retry);
             active.set(threadId, { stop: () => { retry.cancelled = true; retryAbort.abort(); }, turnId });
             emit({
@@ -1993,6 +2000,7 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           nativeImageInput: true,
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
           queueing: true,
+          strictResume: true,
           // Harness turns reassert a per-bot mode and restore the broker even
           // when an old instance was configured with bypassPermissions.
           localComputerMcp: true,
