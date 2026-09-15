@@ -109,11 +109,20 @@ export interface RuntimeEventBase {
   itemId?: string;
   requestId?: string;
   raw?: { source: string; payload: unknown };
+  /** Text the provider's own client produced instead of the model (an API
+   * error it reports as a reply). Rendered like any other item, but not a
+   * sign that the model received or acted on the prompt. */
+  synthetic?: boolean;
 }
 
 export type RuntimeEvent = RuntimeEventBase &
   (
-    | { type: "session.started"; sessionId: string | null; model?: string | null }
+    | {
+        type: "session.started"; sessionId: string | null; model?: string | null;
+        /** the provider refused the turn's resumeCursor and this new session
+         * was started from the turn's recoveryText */
+        rebuilt?: boolean;
+      }
     | { type: "session.model-variants"; model: string; variants: ModelVariantState }
     | { type: "session.exited"; reason?: string }
     | { type: "turn.started" }
@@ -247,6 +256,10 @@ export interface SendTurnInput {
    * prompt (server/resume-recovery.ts) — so a session the provider lost
    * does not brick the thread, and the new session is not blank. */
   recoveryText?: string;
+  /** recoveryText is the replay this turn would have been sent without a
+   * resume cursor (it carries an update from outside the session). A driver
+   * that rebuilds only some lost sessions may also rebuild this one. */
+  recoveryIsReplay?: boolean;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
   /** Bot persona (name/title/description) as a system prompt. */
@@ -394,6 +407,13 @@ export interface ProviderAdapter {
      * MCP servers from config). Same rule as composioMcp: an entry in the
      * config says the servers exist, not that this engine can reach them. */
     customMcp?: boolean;
+    /** True when a turn given a resumeCursor runs in that exact native
+     * session, or, if the provider refuses the session before accepting the
+     * prompt, fails or starts a new session from recoveryText — never a blank
+     * session that silently lacks the history; session.started says `rebuilt`
+     * for that new session. The harness then keeps such a session across
+     * externally appended messages and sends only those. */
+    strictResume?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
