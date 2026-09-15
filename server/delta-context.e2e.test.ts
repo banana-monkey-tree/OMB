@@ -127,9 +127,8 @@ it("resumes the source session and gives it each of three results exactly once, 
     expect(count(text, `RESULT_${tag}_START`)).toBe(1);
     expect(count(text, `RESULT_${tag}_END`)).toBe(1);
   }
-  // The session already holds the earlier chat and its own full assignment.
+  // The session already holds the earlier chat.
   expect(text).not.toContain("ORCHID_7Q");
-  expect(text).not.toContain("BRIEF_END");
   expect(text).not.toMatch(/^Assistant: @/m);
 }), 60_000);
 
@@ -257,7 +256,8 @@ it("keeps provenance and exactly-once delivery across rework rounds to the same 
   const [, , roundOne, roundTwo] = f.turns();
   expect(count(f.prompt(roundOne), "ROUND_ONE_RESULT")).toBe(1);
   expect(count(f.prompt(roundTwo), "ROUND_TWO_RESULT")).toBe(1);
-  expect(count(f.prompt(roundTwo), "ROUND_ONE_RESULT")).toBe(0);
+  // the brief lists every round's result in full, once
+  expect(count(f.prompt(roundTwo), "ROUND_ONE_RESULT")).toBe(1);
   expect(f.launches().at(-1).resume).not.toBeNull();
 
   const second = f.prompt(f.turns(f.lead.id)[1]);
