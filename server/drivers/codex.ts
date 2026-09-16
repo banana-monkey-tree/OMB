@@ -1234,6 +1234,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
         let startedModel: string | null = null;
         let resumedNativeThread = false;
+        let rebuiltFromReplay = false;
         let promptText = turn.text;
         if (cursor) {
           const resumeThread = () => request("thread/resume", {
@@ -1268,7 +1269,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
             // text is the replay it would have had anyway; once, through the
             // same approved model/provider below.
             recoveredMissingSession = true;
-            promptText = recoveryPromptFor({ recoveryText: turn.recoveryText, currentText: turn.text, failure }).text;
+            const rebuild = recoveryPromptFor({ recoveryText: turn.recoveryText, currentText: turn.text, failure });
+            // Announced as rebuilt only when the replacement really carries the
+            // replay; otherwise it holds no more than the turn text.
+            rebuiltFromReplay = rebuild.replayed;
+            promptText = rebuild.text;
           }
         }
         if (!codexThreadId) {
@@ -1294,7 +1299,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         if (!codexThreadId) throw new Error("Codex did not return a native thread id");
         await syncCodexInstructions(threadId, codexThreadId, developerInstructions, resumedNativeThread, request);
-        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null, ...(recoveredMissingSession ? { rebuilt: true } : {}) });
+        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null, ...(rebuiltFromReplay ? { rebuilt: true } : {}) });
         const turnInput = [
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...(turn.images ?? []).map((image) => ({ type: "localImage" as const, path: image.path })),

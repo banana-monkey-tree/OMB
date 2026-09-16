@@ -144,7 +144,7 @@ describe("renderUnseen", () => {
   it("says a message written into a running turn may already be in the session", () => {
     const { block } = renderUnseen([msg("a", "first", { role: "user" }), msg("b", "also cover costs", { role: "user", steered: true })]);
     expect(block).toContain("User: first");
-    expect(block).toContain("User (sent while your previous turn was running; you may already have it): also cover costs");
+    expect(block).toContain("User (sent while an earlier turn was running; you may already have it): also cover costs");
   });
 
   it("separates the block from the turn text with one blank line", () => {
@@ -169,8 +169,8 @@ describe("Handoffs", () => {
     } as RuntimeEvent);
     const start = (handoff: Partial<Handoff>) => {
       handoffs.begin("t", "claim", {
-        botId: "b", instanceId: "claude", config: "c", started: { sent: [] }, recovery: { sent: [] }, resumed: { sent: [] },
-        placed: [], carried: [], own: [], ...handoff,
+        botId: "b", instanceId: "claude", config: "c", resumeCursor: undefined, started: { sent: [] }, recovery: { sent: [] },
+        resumed: { sent: [] }, placed: [], carried: [], own: [], ...handoff,
       });
       handoffs.dispatching("t", "claim");
       handoffs.bindTurn("t", "claim", "turn");
@@ -239,6 +239,20 @@ describe("Handoffs", () => {
     f.event(output);
     f.event({ type: "turn.completed", ok: true });
     expect(unseenIds(order, f.records.get("claude")!)).toEqual(["m4"]);
+  });
+
+  it("takes the handoff of a turn decided again at dispatch, not the one it planned", () => {
+    const order = ids(5);
+    const f = setup(order, { session: "s", config: "c", through: "m2", ids: [] });
+    // planned: resume `s` with the unseen m3; decided again at dispatch: replay
+    f.start({ resumeCursor: "s", placed: ["m3"], carried: ["m4"] });
+    f.handoffs.dispatching("t", "claim", {
+      resumeCursor: undefined, config: "c2", placed: [], carried: ["m4"],
+      started: sessionStart(order, ["m0", "m1", "m2", "m3"], ["m4"]),
+    });
+    f.event({ type: "session.started", sessionId: "new" });
+    f.event(output);
+    expect(f.records.get("claude")).toMatchObject({ session: "new", config: "c2", through: "m4" });
   });
 
   it("does not credit a steer written before a replacement session to that session", () => {

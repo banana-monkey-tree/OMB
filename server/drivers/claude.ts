@@ -1782,8 +1782,10 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
             }
             sessions.delete(threadId);
             session.turn = null;
-            // Same relaunch handle as the transient-retry path above.
-            retry.rebuilt = true;
+            // Same relaunch handle as the transient-retry path above. The new
+            // session is announced as rebuilt only when it is actually given
+            // the replay: with nothing to replay it gets the turn text alone.
+            retry.rebuilt = recovery.replayed;
             retryState.set(threadId, retry);
             active.set(threadId, { stop: () => { retry.cancelled = true; retryAbort.abort(); }, turnId });
             emit({
@@ -1968,7 +1970,15 @@ export const ClaudeDriver: ProviderDriver<ClaudeConfig> = {
           nativeImageInput: true,
           effortLevels: ["low", "medium", "high", "xhigh", "max"],
           queueing: true,
-          strictResume: true,
+          // Only while this CLI can be told to refresh a resumed session's
+          // recorded system prompt (--system-prompt-snapshot). Keeping a
+          // session across an update from outside it means the harness keeps
+          // its prompt too; an older CLI would answer a delegated return with
+          // the instructions of the turn that started the session, where a
+          // fresh session rebuilt them. Unknown version: not yet.
+          get strictResume() {
+            return cliVersionChecked && cliVersion !== null && claudeCliSupports(cliVersion, "--system-prompt-snapshot");
+          },
           // Harness turns reassert a per-bot mode and restore the broker even
           // when an old instance was configured with bypassPermissions.
           localComputerMcp: true,

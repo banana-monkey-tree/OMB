@@ -20,7 +20,8 @@ export interface ContextMessage {
   text: string;
   /** teammate results and other peer-authored text: never deferred */
   keep?: boolean;
-  /** written into a running turn: the session may already have read it */
+  /** written into a turn that was already running: that turn may have read it
+   * before it ended, and no provider says whether it did */
   steered?: boolean;
 }
 
@@ -74,13 +75,12 @@ function floorOf(state: HandedState, position: ReadonlyMap<string, number>): num
  * already holds a newer one, so it arrives out of order. */
 export type UnseenMessage = ContextMessage & { earlier?: boolean };
 
-/** Context messages the session has not been handed, excluding those the
- * turn's own text carries. */
+/** Context messages the session has not been handed. `messages` is the
+ * replayable branch: what the turn's own text carries is already out. */
 export function unseenMessages(
   messages: readonly ContextMessage[],
   order: readonly string[],
   state: HandedState,
-  carried: ReadonlySet<string> = new Set(),
 ): UnseenMessage[] {
   const position = new Map(order.map((id, index) => [id, index]));
   const floor = floorOf(state, position);
@@ -90,15 +90,18 @@ export function unseenMessages(
     ...state.ids.map((id) => position.get(id) ?? -1),
   );
   return messages
-    .filter((m) => (position.get(m.id) ?? -1) > floor && !handed.has(m.id) && !carried.has(m.id))
+    .filter((m) => (position.get(m.id) ?? -1) > floor && !handed.has(m.id))
     .map((m) => (position.get(m.id)! < newestReceived ? { ...m, earlier: true } : m));
 }
 
 /** Render unseen messages oldest first. Every `keep` message is included in
- * full. Others are included newest first while the block stays within
- * UNSEEN_MAX_MESSAGES / UNSEEN_MAX_BYTES, but at least one per turn (a soft
- * budget: `keep` messages and that one can exceed it); the rest are only
- * counted, and stay unseen for a later turn. Returns the ids placed. */
+ * full and none is ever deferred — a teammate result the model cannot see is
+ * the failure this block exists to prevent, so with enough simultaneous
+ * returns the block can be larger than the replay it replaces. The rest are
+ * included newest first while the block stays within UNSEEN_MAX_MESSAGES /
+ * UNSEEN_MAX_BYTES, but at least one per turn (a soft budget: `keep` messages
+ * and that one can exceed it); the others are only counted, and stay unseen
+ * for a later turn. Returns the ids placed. */
 export function renderUnseen(unseen: readonly UnseenMessage[]): { block: string; placed: string[] } {
   if (unseen.length === 0) return { block: "", placed: [] };
   const optional = unseen.filter((m) => !m.keep).reverse();
@@ -111,7 +114,7 @@ export function renderUnseen(unseen: readonly UnseenMessage[]): { block: string;
       "",
       ...(deferred > 0 ? [`(${deferred} older unseen message${deferred === 1 ? " is" : "s are"} not shown in this turn.)`, ""] : []),
       ...(earlier > 0 ? [`(The first ${earlier === 1 ? "message is" : `${earlier} messages are`} older than messages you have already seen.)`, ""] : []),
-      ...shown.map((m) => `${m.role === "user" ? "User" : "Assistant"}${m.steered ? " (sent while your previous turn was running; you may already have it)" : ""}: ${m.text}`),
+      ...shown.map((m) => `${m.role === "user" ? "User" : "Assistant"}${m.steered ? " (sent while an earlier turn was running; you may already have it)" : ""}: ${m.text}`),
     ].join("\n");
   };
   let taken = 0;
@@ -195,8 +198,9 @@ export interface HandoffStore {
 export interface Handoff {
   botId: string;
   instanceId: string;
-  /** the session the turn resumes, when it resumes one */
-  resumeCursor?: string;
+  /** the session the turn resumes; undefined when it starts one. Always
+   * present, so a handoff decided again at dispatch replaces it. */
+  resumeCursor: string | undefined;
   /** HandedState.config for a session this turn starts */
   config: string;
   /** a session started from the turn's own text (a replay, or no history) */

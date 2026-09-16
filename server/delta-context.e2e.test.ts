@@ -16,7 +16,9 @@ const jsonl = (path: string) => existsSync(path)
   ? readFileSync(path, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 
 async function fixture(test: (f: any) => Promise<void>, options: { env?: NodeJS.ProcessEnv; codex?: Record<string, string> } = {}) {
-  const parentEnv = { ...process.env, ...options.env };
+  // The fixture's Claude is a CLI new enough to refresh a resumed session's
+  // recorded system prompt; a test that wants an older one overrides it.
+  const parentEnv = { ...process.env, FAKE_CLAUDE_VERSION: "2.1.270", ...options.env };
   const session = await launchVerificationServer(parentEnv, undefined, undefined, undefined, undefined,
     { scripted: true }, options.codex ? ["codex"] : []);
   const cli = (...args: string[]) => runControlOmb(args, { env: { OPENMAUSBOT_URL: session.info.url } }) as Promise<any>;
@@ -54,8 +56,10 @@ async function fixture(test: (f: any) => Promise<void>, options: { env?: NodeJS.
       return path;
     };
     await api("/api/instances/claude", { cli: wrap("claude", "fake-claude-cli.ts", {}) }, "PATCH");
+    const codexDumpPath = join(dataDir, "codex-dump.json");
     if (options.codex) {
-      await api("/api/instances/codex", { cli: wrap("codex", "fake-codex-app-server.ts", { FAKE_CODEX_MODE: "resume", FAKE_CODEX_ROOM_PLAN: planPath, ...options.codex }) }, "PATCH");
+      await api("/api/instances/codex", { cli: wrap("codex", "fake-codex-app-server.ts",
+        { FAKE_CODEX_MODE: "resume", FAKE_CODEX_ROOM_PLAN: planPath, FAKE_CODEX_DUMP: codexDumpPath, ...options.codex }) }, "PATCH");
     }
     const bot = async (name: string, section: string) => (await cli("new-bot", "--name", name, "--section", section)).bot;
     const chief = await bot("Clive", "Leadership");
@@ -83,6 +87,12 @@ async function fixture(test: (f: any) => Promise<void>, options: { env?: NodeJS.
       .tasks.find((stored: any) => stored.threadId === threadId).busy, { timeout: 30_000 }).toBe(false);
     const launches = (botId = chief.id) => jsonl(launchesPath).filter((launch: any) => launch.botId === botId);
     const codexLaunches = (botId = chief.id) => jsonl(codexLaunchesPath).filter((launch: any) => launch.botId === botId);
+    // The app-server calls of the last Codex launch: thread/resume keeps the
+    // native thread's model and effort, thread/start is where they are set.
+    const codexCalls = () => JSON.parse(readFileSync(codexDumpPath, "utf8")).calls as Array<{ method: string; params: any }>;
+    const codexModels = async () => (await cli("models")).instances.find((item: any) => item.instanceId === "codex").models.options.map((m: any) => m.id);
+    const selectModel = (model: string, extra: Record<string, unknown> = {}) =>
+      api(`/api/bots/${chief.id}/tasks/${thread}`, { modelSelection: { instanceId: "codex", model, ...extra }, requireAvailableModel: true }, "PATCH");
     const setMode = (mode?: string, engine = "claude") => mode ? writeFileSync(modePath(engine), mode) : rmSync(modePath(engine), { force: true });
     const delegate = (key: string, to: any[], message: string, extra: Record<string, unknown> = {}) =>
       ({ steps: [{ arguments: { bot_ids: to.map((b) => b.id), request_key: key, message } }], reply: "Assigned", resumeReply: "Done", ...extra });
@@ -109,7 +119,7 @@ async function fixture(test: (f: any) => Promise<void>, options: { env?: NodeJS.
       }, { timeout: 20_000 }).toBe(true);
     };
     await test({ session, dataDir, cli, api, chief, lead, qa, ops, plan, save, send, wait, idle, turns, prompt, messages, nodes, task, handed,
-      launches, codexLaunches, setMode, delegate, gate, open, thread, useModel, restart });
+      launches, codexLaunches, codexCalls, codexModels, selectModel, setMode, delegate, gate, open, thread, useModel, restart });
   } finally {
     if (restarted) await waitForExit(restarted, { signal: "SIGTERM" });
     await session.close();
@@ -210,7 +220,7 @@ it("offers a message steered into a running turn to the next turn once, marked a
   await f.wait();
   const next = f.prompt(f.turns().at(-1));
   expect(count(next, "STEERED_MID_TURN")).toBe(1);
-  expect(next).toMatch(/User \(sent while your previous turn was running; you may already have it\): STEERED_MID_TURN/);
+  expect(next).toMatch(/User \(sent while an earlier turn was running; you may already have it\): STEERED_MID_TURN/);
 
   f.plan[f.chief.id] = { reply: "Nothing new" };
   await f.send("Anything else?");
@@ -875,6 +885,17 @@ it("gives a delegated return today's fresh session and replay when the soul chan
   expect(f.launches().at(-1).resume).toBeNull();
   expect(f.prompt(returned)).toContain("received an update outside your provider session");
   expect(count(f.prompt(returned), "SETUP_SOUL_RESULT")).toBe(1);
+  // and the record is the replay's, not the resume this turn set out to make
+  const record = Object.values(f.handed())[0] as any;
+  expect(record.session).toBe(Object.values(f.task().resumeCursors)[0]);
+  expect(record.omitted).toBeUndefined();
+  expect(record.through).toBeTruthy();
+
+  f.plan[f.chief.id] = { reply: "Nothing new" };
+  await f.send("And now?");
+  await f.wait();
+  expect(f.launches().at(-1).resume).toBe(Object.values(f.task().resumeCursors)[0]);
+  expect(count(f.prompt(f.turns().at(-1)), "SETUP_SOUL_RESULT")).toBe(0);
 }), 90_000);
 
 it("gives a delegate_bot source today's fresh session and replay when its soul changed since the session started", () => fixture(async (f) => {
@@ -908,3 +929,65 @@ it("gives a delegate_bot source today's fresh session and replay when its soul c
   expect(f.prompt(third)).toContain("received an update outside your provider session");
   expect(count(f.prompt(third), late)).toBe(1);
 }), 120_000);
+
+// ── Settings a resumed session cannot take on ──
+
+it("gives a Codex return the model chosen while its teammate worked", () => fixture(async (f) => {
+  await f.useModel("codex");
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "CODEX_MODEL_RESULT", gateFile: f.gate("lead") };
+  f.plan[f.chief.id] = { turns: [{}, f.delegate("build", [f.lead], "Build the export"), { reply: "Reviewed on the new model" }] };
+  await f.send("Please have Engineering build the export.");
+  await leadRunning(f);
+  await expect.poll(async () => (await f.messages()).some((m: any) => m.role === "bot" && m.text === "Assigned"), { timeout: 15_000 }).toBe(true);
+  // Codex applies a model only when a thread starts: thread/resume would keep the old one.
+  const [, other] = await f.codexModels();
+  await f.selectModel(other);
+  f.open(f.gate("lead"));
+  await f.wait();
+
+  const started = f.codexCalls().filter((call: any) => call.method === "thread/start");
+  expect(started).toHaveLength(1);
+  expect(started[0].params.model).toBe(other);
+  const returned = f.prompt(f.turns().at(-1));
+  expect(returned).toContain("received an update outside your provider session");
+  expect(count(returned, "CODEX_MODEL_RESULT")).toBe(1);
+}, { codex: {} }), 90_000);
+
+it("gives a Codex return today's fresh thread when explicit effort is cleared while its teammate worked", () => fixture(async (f) => {
+  await f.useModel("codex");
+  const [model] = await f.codexModels();
+  await f.selectModel(model, { effort: "high" });
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "CODEX_EFFORT_RESULT", gateFile: f.gate("lead") };
+  f.plan[f.chief.id] = { turns: [{}, f.delegate("build", [f.lead], "Build the export"), { reply: "Reviewed on default effort" }] };
+  await f.send("Please have Engineering build the export.");
+  await leadRunning(f);
+  await expect.poll(async () => (await f.messages()).some((m: any) => m.role === "bot" && m.text === "Assigned"), { timeout: 15_000 }).toBe(true);
+  // An effort the driver does not send leaves the native thread's last value.
+  await f.selectModel(model);
+  f.open(f.gate("lead"));
+  await f.wait();
+
+  expect(f.codexCalls().filter((call: any) => call.method === "thread/start")).toHaveLength(1);
+  expect(f.codexCalls().find((call: any) => call.method === "turn/start")?.params.effort).toBeUndefined();
+  expect(count(f.prompt(f.turns().at(-1)), "CODEX_EFFORT_RESULT")).toBe(1);
+}, { codex: {} }), 90_000);
+
+it("keeps today's fresh return on a Claude CLI that cannot refresh a resumed system prompt", () => fixture(async (f) => {
+  await warmUp(f);
+  f.plan[f.lead.id] = { reply: "OLD_CLI_RESULT", gateFile: f.gate("lead") };
+  f.plan[f.chief.id] = { turns: [{}, f.delegate("build", [f.lead], "Build the export"), { reply: "Reviewed" }] };
+  await f.send("Please have Engineering build the export.");
+  await leadRunning(f);
+  f.open(f.gate("lead"));
+  await f.wait();
+
+  expect(f.launches().at(-1).resume).toBeNull();
+  const returned = f.prompt(f.turns().at(-1));
+  expect(returned).toContain("received an update outside your provider session");
+  expect(returned).toContain("ORCHID_7Q");
+  expect(count(returned, "OLD_CLI_RESULT")).toBe(1);
+  // nothing recorded: this engine cannot be given only what it has not seen
+  expect(f.handed()).toBeUndefined();
+}, { env: { FAKE_CLAUDE_VERSION: "2.1.200" } }), 90_000);

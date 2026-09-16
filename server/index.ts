@@ -5350,11 +5350,15 @@ async function startTurn(
   const unseen = handed && handedStateUsable(handed, cursor, contextOrder) ? unseenMessages(replayable, contextOrder, handed) : undefined;
   // A teammate's result or reply: without records this turn would replay.
   const externalUpdate = Boolean(opts?.coordination?.resumed || unseen?.some((m) => m.keep));
-  // Standing instructions a resumed session keeps from its launch (model,
-  // tools and servers are passed on every launch). An external update that
-  // finds them changed since the session started — a new soul, say — gets
-  // the fresh session and replay it always got, rather than a resume.
-  const persistentConfig = [bot.name, bot.title, bot.description, sectionContextSystemPrompt(bot.section)];
+  // What a resumed session keeps from its launch: the standing instructions
+  // (tools, servers and — for Claude — the model are passed on every launch),
+  // plus whatever this engine can only set when a session starts. Codex's
+  // thread/resume sends no model selection, and an effort it is not sent stays
+  // at the thread's last value, so both belong to the session there. An
+  // external update that finds any of it changed since the session started
+  // gets the fresh session and replay it always got, rather than a resume.
+  const persistentConfig = [bot.name, bot.title, bot.description, sectionContextSystemPrompt(bot.section),
+    ...(instance.driverKind === "codex" ? [model, effort ?? null] : [])];
   const sessionConfig = (soul: string | undefined) =>
     createHash("sha256").update(JSON.stringify([...persistentConfig, soul])).digest("hex").slice(0, 16);
   const plannedConfig = sessionConfig(bot.soul);
@@ -5410,7 +5414,7 @@ async function startTurn(
       turnText: withUnseenMessages(unseenBlock, contextTurnText),
       resumeCursor, recoveryText, recoveryIsReplay,
       handoff: strictResume ? {
-        botId: bot.id, instanceId, config, ...(typeof resumeCursor === "string" ? { resumeCursor } : {}),
+        botId: bot.id, instanceId, config, resumeCursor: typeof resumeCursor === "string" ? resumeCursor : undefined,
         started: sessionStart(contextOrder, contextTurnText !== userTurnText ? windowIds : [], carried),
         recovery: sessionStart(contextOrder, recoveryText !== undefined ? windowIds : [], carried),
         resumed: sessionStart(contextOrder, [], [...placed, ...carried]),

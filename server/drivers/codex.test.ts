@@ -837,6 +837,20 @@ describe("CodexDriver turns (fake app-server)", () => {
     expect(recorder.events.filter((e) => e.type === "session.started")).toMatchObject([{ rebuilt: true }]);
   });
 
+  it("does not announce a rebuilt Company thread when the recovery text is the turn itself", async () => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-no-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "company-no-replay", text: "Continue", resumeCursor: "gone-company-thread",
+      recoveryText: "Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(recorder.events.filter((event) => event.type === "session.started").at(-1)).not.toMatchObject({ rebuilt: true });
+  });
+
   it("keeps successful Company resumes native without replaying the canonical transcript", async () => {
     await create({ managed: true, mode: "resume" });
     const dump = join(scratch, "company-resume.json");
