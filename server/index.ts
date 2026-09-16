@@ -10077,6 +10077,15 @@ function readBody(req: IncomingMessage, limit = 1_000_000): Promise<any> {
     });
     req.on("end", () => {
       if (done) return;
+      // A body without a declared application/json content-type is either a
+      // client bug or a browser's CORS "simple request" (text/plain,
+      // form-urlencoded, multipart) — the shape that reaches this server
+      // without a preflight. Requiring the real content-type costs every
+      // existing caller nothing (they already send it) and closes off the
+      // simple-request path for anyone who does not.
+      if (data && !/^application\/json\b/i.test(String(req.headers["content-type"] ?? ""))) {
+        return fail(415, "content-type must be application/json");
+      }
       let body: any;
       try {
         body = data ? JSON.parse(data) : {};

@@ -1054,6 +1054,63 @@ describe("harness HTTP API", () => {
     expect(await statusWithHeaders({ origin: `http://[::1]:${PORT}` })).toBe(200);
   });
 
+  // T51 / U12: a page open in the user's browser is a loopback client too. A
+  // CORS "simple request" (no preflight) from another loopback port must not
+  // be able to drive an owner mutation, and the fix must not cost anything
+  // for the shapes real clients actually use.
+  it("refuses a browser-shaped mutation from another loopback port, but keeps every real client working", async () => {
+    const member = (await api("POST", "/api/bots")).body.bot;
+    try {
+      const foreignOrigin = `http://127.0.0.1:${PORT + 1}`;
+      const roomBody = JSON.stringify({ name: "t51-hardening-probe", memberIds: [member.id] });
+
+      // A CORS simple request (text/plain, no custom headers) from a
+      // different loopback port must be refused before the body is ever
+      // parsed.
+      const crossPort = await fetch(`${BASE}/api/groups`, {
+        method: "POST",
+        headers: { "content-type": "text/plain", origin: foreignOrigin },
+        body: roomBody,
+      });
+      expect(crossPort.status).toBe(403);
+      expect(((await crossPort.json()) as { error: string }).error).toBe("forbidden: cross-origin request");
+
+      // Same loopback port (a real same-origin browser request) but still the
+      // simple-request content-type: the origin check now passes, so this is
+      // refused by the separate content-type gate instead.
+      const sameOriginWrongType = await fetch(`${BASE}/api/groups`, {
+        method: "POST",
+        headers: { "content-type": "text/plain", origin: BASE },
+        body: roomBody,
+      });
+      expect(sameOriginWrongType.status).toBe(415);
+
+      // A legitimate same-origin browser request (matching Origin, declared
+      // JSON) still creates the room.
+      const sameOrigin = await fetch(`${BASE}/api/groups`, {
+        method: "POST",
+        headers: { "content-type": "application/json", origin: BASE },
+        body: roomBody,
+      });
+      expect(sameOrigin.status).toBe(201);
+      const sameOriginRoom = ((await sameOrigin.json()) as { group: { id: string } }).group.id;
+      await api("DELETE", `/api/groups/${sameOriginRoom}`);
+
+      // A non-browser client that sends no Origin at all (this project's own
+      // CLI, curl, the lsp UI proxy) is unaffected.
+      const noOrigin = await api("POST", "/api/groups", { name: "t51-hardening-probe-no-origin", memberIds: [member.id] });
+      expect(noOrigin.status).toBe(201);
+      await api("DELETE", `/api/groups/${noOrigin.body.group.id}`);
+
+      // Reads are untouched: an anonymous loopback GET from another port still
+      // works exactly as SECURITY.md says it should.
+      const crossPortRead = await fetch(`${BASE}/api/bots`, { headers: { origin: foreignOrigin } });
+      expect(crossPortRead.status).toBe(200);
+    } finally {
+      await api("DELETE", `/api/bots/${member.id}`);
+    }
+  });
+
   it("keeps the fleet screen behind the admin entitlement on the open-source edition", async () => {
     const fleet = await api("GET", "/api/fleet");
     expect(fleet.status).toBe(403);

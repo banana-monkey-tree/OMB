@@ -281,6 +281,77 @@ describe("resolveRequestAuth", () => {
     ).auth?.kind).toBe("loopback");
   });
 
+  // T51 / U12: isAllowedOrigin only ruled out a non-loopback Origin; it never
+  // checked the port, so any loopback service - including a browser tab on
+  // another port - passed the same gate as the server's own origin. A public
+  // mutation now additionally requires a present Origin to be this server's
+  // own, port included (the same rule isSameOrigin already applies to the
+  // session-cookie path), on both the self-hosted server and the Electron
+  // desktop build.
+  it("requires a port-exact Origin for public loopback mutations, on both the self-hosted server and the desktop build", () => {
+    const selfHosted = {
+      sessions, cookieName, streamPath: "/api/events", url: new URL("/api/groups", "http://x"),
+      // no loopbackMutationToken: this is the shape `openmausbot serve` / `service install` run in.
+    };
+    // Another loopback port (a browser tab's own origin, not this server's) is refused.
+    const foreignPort = resolveRequestAuth(
+      request({ host: "127.0.0.1:8799", origin: "http://127.0.0.1:5555" }, "POST"),
+      selfHosted,
+    );
+    expect(foreignPort.auth).toBeNull();
+    expect(foreignPort.status).toBe(403);
+    expect(foreignPort.error).toBe("forbidden: cross-origin request");
+    // No Origin at all (CLI, curl, this project's own tooling) still works.
+    expect(resolveRequestAuth(
+      request({ host: "127.0.0.1:8799" }, "POST"),
+      selfHosted,
+    ).auth?.kind).toBe("loopback");
+    // The server's own origin still works.
+    expect(resolveRequestAuth(
+      request({ host: "127.0.0.1:8799", origin: "http://127.0.0.1:8799" }, "POST"),
+      selfHosted,
+    ).auth?.kind).toBe("loopback");
+    // Reads are unaffected by the new port check: SECURITY.md's anonymous
+    // loopback read stays open even cross-port.
+    expect(resolveRequestAuth(
+      request({ host: "127.0.0.1:8799", origin: "http://127.0.0.1:5555" }, "GET"),
+      { ...selfHosted, url: new URL("/api/bots", "http://x") },
+    ).auth?.kind).toBe("loopback");
+
+    // The Electron desktop build: the new Origin gate runs before the
+    // existing desktop-owner-header check, so a foreign-port Origin is
+    // refused even when the correct per-launch capability is also present -
+    // that header proves the request came from the packaged app's own
+    // privileged channel, not that it came from the app's own window.
+    const desktopOptions = { ...selfHosted, loopbackMutationToken: "owner-token-123" };
+    const desktopForeignOrigin = resolveRequestAuth(
+      request({
+        host: "127.0.0.1:8799",
+        origin: "http://127.0.0.1:5555",
+        "x-openmausbot-desktop-owner": "owner-token-123",
+      }, "POST"),
+      desktopOptions,
+    );
+    expect(desktopForeignOrigin.auth).toBeNull();
+    expect(desktopForeignOrigin.status).toBe(403);
+    expect(desktopForeignOrigin.error).toBe("forbidden: cross-origin request");
+    // No Origin (Electron's own request path today) plus the correct
+    // capability still works, exactly as before this change.
+    expect(resolveRequestAuth(
+      request({ host: "127.0.0.1:8799", "x-openmausbot-desktop-owner": "owner-token-123" }, "POST"),
+      desktopOptions,
+    ).auth?.kind).toBe("loopback");
+    // Same-origin plus the correct capability still works.
+    expect(resolveRequestAuth(
+      request({
+        host: "127.0.0.1:8799",
+        origin: "http://127.0.0.1:8799",
+        "x-openmausbot-desktop-owner": "owner-token-123",
+      }, "POST"),
+      desktopOptions,
+    ).auth?.kind).toBe("loopback");
+  });
+
   it("never grants loopback trust to a request that came through a proxy, whatever Host it carries", () => {
     expect(isProxied(request({ host: "localhost", "x-forwarded-for": "203.0.113.9" }))).toBe(true);
     expect(isProxied(request({ host: "localhost", "x-forwarded-proto": "https" }))).toBe(true);

@@ -383,6 +383,15 @@ export function resolveRequestAuth(req: IncomingMessage, options: ResolveOptions
       ) return deny(403, "forbidden: invalid companion request");
       return { auth: { kind: "loopback", scopes: LOOPBACK_SCOPES }, status: 401, error: "" };
     }
+    // isAllowedOrigin above only ruled out a non-loopback Origin; a page on
+    // ANY loopback port is a loopback client too, so a mutation additionally
+    // needs the Origin (when a browser sends one) to be this server's own -
+    // port included, the same check the session-cookie path already applies
+    // via isSameOrigin. A request with no Origin (CLI, curl, this project's
+    // own tooling) is unaffected: isSameOrigin treats absent as same-origin.
+    if (mutatingPublicRoute(method, path) && !isSameOrigin(req)) {
+      return deny(403, "forbidden: cross-origin request");
+    }
     if (
       options.loopbackMutationToken !== undefined &&
       mutatingPublicRoute(method, path) &&
