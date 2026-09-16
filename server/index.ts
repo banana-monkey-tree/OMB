@@ -11431,7 +11431,18 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
             threadId: destination ? destination.id === source?.id ? address.threadId : destination.threadId : store.bot(botId)?.threadId ?? "", botId,
           }));
           for (const target of targets) {
-            const eligibility = target.botId === internalSender.id ? "Choose a teammate, not yourself" : roomHandoffProblem(target, address);
+            // roomHandoffProblem's "no longer exists" is written for a route
+            // that was valid and went away. Here the id is the model's own
+            // argument — usually a display name dropped into a bot_ids slot —
+            // so say which id failed and where the real ones are, instead of
+            // telling the model a teammate it can still reach is gone. Only
+            // the id the caller sent is echoed back, never a bot's name.
+            const addressed = store.bot(target.botId);
+            const eligibility =
+              target.botId === internalSender.id ? "Choose a teammate, not yourself"
+              : !addressed ? `No bot with id "${target.botId}" — call list_bots and copy the exact id from the result`
+              : addressed.hidden ? `The bot with id "${target.botId}" is no longer available — call list_bots for the ones you can reach`
+              : roomHandoffProblem(target, address);
             if (eligibility) return json(res, 403, { error: eligibility });
           }
           let approvalGranted = false;
