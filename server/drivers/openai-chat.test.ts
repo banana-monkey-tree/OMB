@@ -46,6 +46,73 @@ describe("createOpenAIChatRuntime stream termination", () => {
     expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 5, output: 9 } });
   });
 
+  it("parses a final finish_reason+usage frame with no trailing newline before the socket closes", async () => {
+    // No trailing \n\n after the last frame -- the connection just closes,
+    // the way it does against several real OpenAI-compatible local servers.
+    const events = await runTurn(
+      'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n' +
+        'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":9}}',
+    );
+    expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "Hello" });
+    expect(events.find((event) => event.type === "runtime.error")).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 5, output: 9 } });
+  });
+
+  it("splits a final unterminated frame across two stream chunks", async () => {
+    let controller: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+    });
+    const encoder = new TextEncoder();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string | URL | Request) => {
+        if (String(input).endsWith("/models")) return new Response(JSON.stringify({ data: [] }), { status: 200 });
+        return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream" } });
+      }),
+    );
+    const instance = await OpenAICompatDriver.create({
+      instanceId: "minimax", displayName: "MiniMax", enabled: true,
+      config: OpenAICompatDriver.decodeConfig({ url: "https://api.minimax.io/v1", apiKeyEnv: "MINIMAX_API_KEY", model: "MiniMax-M3" }),
+      environment: { MINIMAX_API_KEY: "secret" },
+    });
+    const events: RuntimeEvent[] = [];
+    instance.adapter.onEvent((event) => events.push(event));
+    await instance.adapter.sendTurn({ threadId: "thread", text: "hi" });
+    // The final frame's closing brace and its usage object arrive in a
+    // second chunk, after the first chunk already delivered a complete
+    // earlier frame -- proves the leftover-buffer flush on EOF works
+    // whether the split content arrived in one decoder.decode() call or
+    // accumulated across several.
+    controller!.enqueue(
+      encoder.encode(
+        'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n' +
+          'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"comple',
+      ),
+    );
+    controller!.enqueue(encoder.encode('tion_tokens":9}}'));
+    controller!.close();
+    await vi.waitFor(() => {
+      if (!events.some((event) => event.type === "turn.completed")) throw new Error("turn still running");
+    });
+    await instance.dispose();
+    expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "Hello" });
+    expect(events.find((event) => event.type === "runtime.error")).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 5, output: 9 } });
+  });
+
+  it("does not misfire on an empty final flush when the stream ends cleanly on a newline", async () => {
+    const events = await runTurn(
+      'data: {"choices":[{"index":0,"delta":{"content":"hi"}}]}\n\n' +
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}\n\n',
+    );
+    expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "hi" });
+    expect(events.find((event) => event.type === "runtime.error")).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 1, output: 1 } });
+  });
+
   it("still honors data: [DONE]", async () => {
     const events = await runTurn('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n');
     expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "hi" });
