@@ -41,6 +41,21 @@ jobs:
         U33 | server/index.test.ts | team import is additive-only: smuggled grants, claimed ids, and re-imports never touch existing records
         # race: the replacement AppImage can still see the Electron parent pid alive (parentAlive: true) under load
         U38 | electron/vendor-updater.node-test.mjs | Electron relaunch waits for deferred cleanup and the replacement acquires the same data directory
+        # source-slicing drift: index.ts moved between v0.1.80 and v0.1.82, the
+        # fixture's marker-based section() slice now lands mid-declaration
+        # (bare "async" token) — confirmed pre-existing on a bare v0.1.82 tag
+        # checkout, unrelated to the U1 backport (T59)
+        U42 | server/managed-desktop-cleanup.test.ts | preserves a personal direct turn started while a slower Company sibling is stopping
+        U42 | server/managed-desktop-cleanup.test.ts | interruptDirectThread cannot close a replacement generation's approval after awaiting its adapter
+        U42 | server/managed-desktop-cleanup.test.ts | preserves a group replacement's speaker, resources and busy state after the old interrupt resolves
+        U42 | server/managed-desktop-cleanup.test.ts | skips a later snapshot entry replaced while an earlier group interrupt is pending
+        U42 | server/managed-desktop-cleanup.test.ts | also fences group resource-generation changes when the speaker object is unchanged
+        U42 | server/managed-desktop-cleanup.test.ts | still releases the original direct turn when no replacement has claimed it
+        U42 | server/managed-desktop-cleanup.test.ts | still releases the original group turn when no replacement has claimed it
+        U42 | server/managed-desktop-cleanup.test.ts | quitting disposes Company instances without interrupting turns or writing connection-changed cards
+        # docs/verification/computer-wait.md isn't linked from README.md — confirmed
+        # pre-existing on a bare v0.1.82 tag checkout, unrelated to the U1 backport (T59)
+        U43 | scripts/testing/verification-docs.test.ts | are all reachable from README.md
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
