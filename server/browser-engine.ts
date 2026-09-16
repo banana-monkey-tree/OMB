@@ -278,7 +278,7 @@ export async function installAgentBrowserBinary(options: {
 /** `agent-browser install` fetches Chrome for Testing when no Chrome, Chromium
  * or Brave is found; `--with-deps` adds the Linux libraries (needs a package
  * manager and privileges, so it is for images and root shells). */
-export function ensureChrome(binaryPath: string, options: { withDeps?: boolean; env?: NodeJS.ProcessEnv; log?: (line: string) => void } = {}): Promise<void> {
+export function ensureChrome(binaryPath: string, options: { withDeps?: boolean; env?: NodeJS.ProcessEnv; platform?: NodeJS.Platform; arch?: string; log?: (line: string) => void } = {}): Promise<void> {
   const bundle = packagedBrowser(options);
   if (!options.withDeps && bundle && resolve(binaryPath) === bundle.engine && completePackage(bundle, existsSync)) {
     options.log?.("agent-browser: the bundled browser is ready; no download needed");
@@ -350,6 +350,8 @@ export function agentBrowserIntegration(input: {
   persistent?: boolean;
   headless?: boolean;
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
+  arch?: string;
 }): { command: string; args: string[]; env: Record<string, string> } {
   const sourceEnv = input.env ?? process.env;
   const env: Record<string, string> = {
@@ -376,7 +378,7 @@ export function agentBrowserIntegration(input: {
   for (const name of ["PATH", "AGENT_BROWSER_EXECUTABLE_PATH"] as const) {
     if (sourceEnv[name]) env[name] = sourceEnv[name];
   }
-  const bundle = packagedBrowser({ env: sourceEnv });
+  const bundle = packagedBrowser({ env: sourceEnv, platform: input.platform, arch: input.arch });
   if (!env.AGENT_BROWSER_EXECUTABLE_PATH && bundle && resolve(input.binaryPath) === bundle.engine && completePackage(bundle, existsSync)) {
     env.AGENT_BROWSER_EXECUTABLE_PATH = bundle.chrome;
   }
