@@ -1401,7 +1401,14 @@ describe("CodexDriver turns (fake app-server)", () => {
     await recorder.until((e) => e.type === "request.opened");
     await expect(instance.adapter.sendTurn({ threadId: "t-busy", text: "two" })).rejects.toThrow(/already running/);
     await instance.adapter.interruptTurn("t-busy");
-    await recorder.until((e) => e.type === "turn.completed");
+    // U21 retest: a requested stop (interruptTurn -> child killed -> close
+    // fires before the app-server ever sends turn/completed) must settle as
+    // an interrupted turn, not a false runtime.error/exit_before_result.
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({
+      ok: false,
+      stopReason: "interrupted",
+    });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
   });
 
   it.each([false, true])("keeps ownership after an uncertain stop even when root close arrives (before failure: %s)", async (closeFirst) => {
