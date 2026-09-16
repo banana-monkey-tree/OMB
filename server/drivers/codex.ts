@@ -1199,6 +1199,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           void stop();
           return;
         }
+        // A requested stop is an interruption, so skip exit-error handling.
+        if (stopRequested) {
+          void settle(false, "interrupted");
+          return;
+        }
         // The child died before the turn completed. Attribute the exit
         // honestly: name the signal when it was killed, and only quote
         // stderr that arrived after the last protocol message. A stale
