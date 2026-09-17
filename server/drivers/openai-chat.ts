@@ -207,7 +207,7 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      const consumeDataLine = (line: string): boolean => {
+      const consumeDataLine = (line: string, atEof = false): boolean => {
         if (!line.startsWith("data:")) return false;
         const data = line.slice(5).trim();
         if (data === "[DONE]") return true;
@@ -215,7 +215,13 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
         try {
           chunk = JSON.parse(data) as CompletionJson;
         } catch {
-          malformedFrame = true;
+          // A tail left in the buffer when the socket closed is an INCOMPLETE
+          // frame, not a bad one: a stop, an abort or a dropped connection all
+          // end mid-frame. Only a properly newline-terminated frame that will
+          // not parse means the provider actually sent something malformed.
+          // Counting the tail here turned a stopped turn into a hard,
+          // non-retryable failure (`calls.finish(finishReason, malformedFrame)`).
+          if (!atEof) malformedFrame = true;
           return false;
         }
         const chunkError = providerError(chunk);
@@ -250,7 +256,7 @@ export function createOpenAIChatRuntime<Config>(options: RuntimeOptions<Config>)
           if (done) {
             buffer += decoder.decode();
             const line = buffer.trim();
-            if (line && line !== "data: [DONE]") consumeDataLine(line);
+            if (line && line !== "data: [DONE]") consumeDataLine(line, true);
             // MiniMax's api.minimax.io/v1 closes the connection after the
             // finish_reason chunk and never sends `[DONE]`.
             if (buffer.trim() === "data: [DONE]" || finishReason) break;

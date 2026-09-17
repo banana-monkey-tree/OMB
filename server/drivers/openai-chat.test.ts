@@ -187,6 +187,20 @@ describe("createOpenAIChatRuntime stream termination", () => {
     expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true, usage: { input: 1, output: 1 } });
   });
 
+  it("settles a turn whose stream was cut mid-frame instead of failing it", async () => {
+    // A person stopping a turn (or a dropped connection) leaves a partial
+    // frame in the buffer. Before the EOF flush was guarded this was parsed,
+    // failed JSON.parse, set malformedFrame, and turned a clean stop into a
+    // hard non-retryable failure -- caught by delta-context.e2e on Windows.
+    const events = await runTurn(
+      'data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":"stop"}]}\n\n'
+        + 'data: {"choices":[{"index":0,"delta":{"content":" wor',
+    );
+    expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "Hello" });
+    expect(events.find((event) => event.type === "runtime.error")).toBeUndefined();
+    expect(events.at(-1)).toMatchObject({ type: "turn.completed", ok: true });
+  });
+
   it("still honors data: [DONE]", async () => {
     const events = await runTurn('data: {"choices":[{"delta":{"content":"hi"}}]}\n\ndata: [DONE]\n\n');
     expect(events.find((event) => event.type === "item.completed")).toMatchObject({ text: "hi" });
