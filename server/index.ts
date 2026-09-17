@@ -5014,6 +5014,19 @@ function isContextMessage(m: Message): boolean {
  * (see the group branch of pushMessage). */
 const isRoomThread = (threadId: string) => Boolean(store.groupByThread(threadId));
 
+/** Every thread of every room this bot is a member of, to the room it belongs
+ * to. session_search and session_read both scope by it, so what a member can
+ * find and what it can read cannot come apart. */
+function roomThreadsFor(botId: string): Map<string, GroupRecord> {
+  const rooms = new Map<string, GroupRecord>();
+  for (const group of store.groups) {
+    if (!group.memberIds.includes(botId)) continue;
+    rooms.set(group.threadId, group);
+    for (const task of group.tasks ?? []) rooms.set(task.threadId, group);
+  }
+  return rooms;
+}
+
 const handoffs = new Handoffs({
   order: (threadId) => store.activePath(threadId).filter(isContextMessage).map((m) => m.id),
   read: (botId, threadId, instanceId) => isRoomThread(threadId)
@@ -11499,12 +11512,7 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         // Own threads: the bot's main chat and tasks, and the rooms it is a
         // member of with their tasks — conversations it already saw in full.
         // Still own-bot: another bot's threads never enter this list.
-        const roomByThread = new Map<string, GroupRecord>();
-        for (const group of store.groups) {
-          if (!group.memberIds.includes(from.id)) continue;
-          roomByThread.set(group.threadId, group);
-          for (const task of group.tasks ?? []) roomByThread.set(task.threadId, group);
-        }
+        const roomByThread = roomThreadsFor(from.id);
         const ownThreads = [...new Set([from.threadId, ...(from.tasks ?? []).map((task) => task.threadId), ...roomByThread.keys()])];
         // A room is the only place a recall can be a disclosure, and only a
         // private chat is one: in a 1:1 the user already owns every thread
@@ -11542,7 +11550,11 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
         const threadId = String(url.searchParams.get("threadId") ?? "").trim();
         const messageId = String(url.searchParams.get("messageId") ?? "").trim();
         if (!threadId || !messageId) return json(res, 400, { error: "threadId and messageId are required" });
-        const own = threadId === from.threadId || Boolean(store.taskByThread(from.id, threadId));
+        // A room the bot is a member of is one of its own conversations: it
+        // was in the room when the line was said, session_search returns it,
+        // and without this reading that hit's own id answers "no such message".
+        const room = roomThreadsFor(from.id).get(threadId);
+        const own = threadId === from.threadId || Boolean(store.taskByThread(from.id, threadId)) || Boolean(room);
         const message = own ? readMessageText(threadId, messageId) : null;
         if (!message) return json(res, 404, { error: "no such message in your conversations" });
         const readInRoom = Boolean(store.groupByThread(fromThreadId));
@@ -11552,7 +11564,9 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
           ...message,
           crossed: readCrossed,
           text: message.text.length > SESSION_READ_MAX_CHARS ? `${message.text.slice(0, SESSION_READ_MAX_CHARS)}…` : message.text,
-          task: store.taskByThread(from.id, threadId)?.title,
+          // Labelled as session_search labels the same hit.
+          task: room ? (room.tasks ?? []).find((task) => task.threadId === threadId)?.title : store.taskByThread(from.id, threadId)?.title,
+          ...(room ? { room: room.name } : {}),
         });
       }
       if (method === "GET" && path === "/api/internal/skills") {

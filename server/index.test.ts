@@ -9027,6 +9027,32 @@ describe("bot memory API", () => {
       const future = (await (await search({ since: String(Date.now() + 60_000) })).json()) as { hits: unknown[] };
       expect(future.hits).toEqual([]);
 
+      // session_read reads the id that hit came from. Without this a member
+      // is handed a room message id by search and told there is no such
+      // message reading it, which is also how it pulls a room line older than
+      // the window its turn was built with.
+      const read = async (threadId: string, messageId: string, fromBotId = bot.id, fromThreadId = bot.threadId) =>
+        fetch(
+          `${BASE}/api/internal/session-read?${new URLSearchParams({ fromBotId, fromThreadId, threadId, messageId })}`,
+          { headers: { authorization: `Bearer ${await mintTestCapability(BASE, fromBotId, fromThreadId)}` } },
+        );
+      const roomRead = await read(roomThreadId, String(roomHit.messageId));
+      expect(roomRead.status).toBe(200);
+      expect(await roomRead.json()).toMatchObject({
+        threadId: roomThreadId,
+        room: "Standup",
+        text: "Standup: what did everyone do yesterday?",
+        // a crossing is a private thread read INTO a room; reading a room from
+        // a 1:1, or from that room itself, discloses nothing either way
+        crossed: false,
+      });
+      expect(await (await read(roomThreadId, String(roomHit.messageId), bot.id, roomThreadId)).json())
+        .toMatchObject({ crossed: false });
+      // a bot that is not a member still reads it as missing, not forbidden
+      expect((await api("PATCH", `/api/groups/${groupId}`, { memberIds: [other.id] })).status).toBe(200);
+      expect((await read(roomThreadId, String(roomHit.messageId))).status).toBe(404);
+      expect((await api("PATCH", `/api/groups/${groupId}`, { memberIds: [bot.id, other.id] })).status).toBe(200);
+
       // from inside the room, a 1:1 hit is a crossing; a room hit is not
       const fromRoom = (await (await search({ since: "1d" }, bot.id, roomThreadId)).json()) as { hits: Array<Record<string, unknown>> };
       expect(fromRoom.hits.find((hit) => hit.threadId === bot.threadId)).toMatchObject({ crossed: true });

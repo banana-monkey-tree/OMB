@@ -730,7 +730,7 @@ const TOOLS = [
   {
     name: "session_read",
     description:
-      "Read the full text of one message from your own earlier conversations, using the thread id and message id a session_search hit gave you. Use it when a hit's snippet is the right message but you need the whole thing (a report, a list, a set of recommendations). Long messages are cut at 8,000 characters.",
+      "Read the full text of one message from your own earlier conversations — your tasks and the rooms you are in — using the thread id and message id a session_search hit gave you. Use it when a hit's snippet is the right message but you need the whole thing (a report, a list, a set of recommendations), and to read a room message older than the conversation you were shown this turn. Long messages are cut at 8,000 characters.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
