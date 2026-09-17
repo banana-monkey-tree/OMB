@@ -13,6 +13,7 @@ import { pipeline } from "node:stream/promises";
 import * as tar from "tar";
 import { fromMarkdown } from "mdast-util-from-markdown";
 import { writeFileAtomic } from "./atomic.ts";
+import { toWireGroup, type GroupRecord } from "./store.ts";
 import { escapeAttribute, splitTranscriptAttachments } from "../src/lib/composer-attachments.ts";
 import { WORKSPACE_BACKUP_CLIENT_KEYS } from "../shared/workspace-backup-client.ts";
 import { excludedWorkspaceAuthPath, portableWorkspaceConfig, restoredWorkspaceConfig } from "./workspace-backup-policy.ts";
@@ -318,9 +319,14 @@ export async function createWorkspaceBackup(dataDir: string, options: CreateWork
           walk(source, path);
         } else if (stat.isFile()) {
           let copied: { size: number; mode: number; sha256: string };
-          if (path === "config.json" || path === "webhooks.json") {
+          if (path === "config.json" || path === "webhooks.json" || path === "groups.json") {
             const value = privateJson(source);
             if (path === "config.json") writeJson(destination, portableWorkspaceConfig(value));
+            else if (path === "groups.json") {
+              // A portable room cannot carry private provider sessions or delivery records.
+              if (!Array.isArray(value)) throw new Error("Invalid rooms in workspace backup.");
+              writeJson(destination, value.map((group: GroupRecord) => toWireGroup(group)));
+            }
             else {
               if (!record(value)) throw new Error("Invalid webhook definitions in workspace backup.");
               if (Array.isArray(value.webhooks)) for (const webhook of value.webhooks) if (record(webhook)) delete webhook.secretHash;

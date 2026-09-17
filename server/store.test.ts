@@ -4,6 +4,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { soulFile, soulHash } from "./bot-folder.ts";
@@ -13,7 +14,7 @@ import type { ModelSelection } from "./contracts.ts";
 import * as mdb from "./message-db.ts";
 import { peerAllowKey } from "./peer-approval-key.ts";
 import { canAccessTeam } from "./peer-roster.ts";
-import { Store, type BotRecord } from "./store.ts";
+import { Store, toWireGroup, type BotRecord } from "./store.ts";
 import type { TeamSetupRequest } from "../shared/team-setup.ts";
 import { SECTION_CONTEXTS_FILE } from "./section-context.ts";
 
@@ -22,6 +23,98 @@ const selection = (): ModelSelection => ({ instanceId: "claude", model: "claude-
 describe("Store", () => {
   beforeEach(() => {
     rmSync(DATA_DIR, { recursive: true, force: true });
+  });
+
+  describe("room member records", () => {
+    const setup = () => {
+      const store = new Store(selection);
+      const a = store.createBot({ name: "A" });
+      const b = store.createBot({ name: "B" });
+      const group = store.createGroup("Room", [a.id, b.id]);
+      return { store, a, b, group };
+    };
+
+    it("persists a member's cursor, dispatch and delivery record across reload", () => {
+      const { store, a, group } = setup();
+      const state = { session: "session-a", ids: ["room-message"] };
+      store.setRoomResumeCursor(group.threadId, a.id, "claude", "session-a");
+      store.markRoomMemberDispatched(group.threadId, a.id, "claude");
+      store.setRoomHandedMessages(group.threadId, a.id, "claude", state);
+      const expected = { resumeCursors: { claude: "session-a" }, lastInstanceId: "claude", handedMessages: { claude: state } };
+      expect(store.roomMemberRecord(group.threadId, a.id)).toEqual(expected);
+      expect(JSON.parse(readFileSync(join(DATA_DIR, "groups.json"), "utf8"))[0].members[group.threadId][a.id]).toEqual(expected);
+      expect(new Store(selection).roomMemberRecord(group.threadId, a.id)).toEqual(expected);
+    });
+
+    it("never exposes member records through publicGroupState", () => {
+      const { store, a, group } = setup();
+      store.setRoomResumeCursor(group.threadId, a.id, "claude", "private-session");
+      // Evaluate only the actual projection: importing index would start a server.
+      const source = readFileSync(new URL("./index.ts", import.meta.url), "utf8");
+      const body = source.match(/function publicGroupState\(group: GroupRecord\): WireGroup \{([\s\S]*?)\n\}/)![1];
+      const projected = runInNewContext(`(function(group) {${body}})(group)`, {
+        group, toWireGroup, groupIsWorking: () => false, roomHandoffs: { nodes: new Map() },
+      });
+      expect(projected).not.toHaveProperty("members");
+      expect(projected).toEqual({ ...toWireGroup(group), working: false });
+      expect(group.members).toBeDefined();
+    });
+
+    it("forgets removed members on every thread, preserving other members and pruning empty maps", () => {
+      const { store, a, b, group } = setup();
+      const first = group.threadId;
+      const second = store.createGroupTask(group.id)!.threadId;
+      for (const thread of [first, second]) {
+        store.setRoomResumeCursor(thread, a.id, "claude", "a");
+        store.setRoomResumeCursor(thread, b.id, "claude", "b");
+      }
+      store.patchGroup(group.id, { memberIds: [b.id] });
+      store.forgetRoomMembers(group.id, [a.id]);
+      for (const thread of [first, second]) {
+        expect(store.roomMemberRecord(thread, a.id)).toBeUndefined();
+        expect(store.roomMemberRecord(thread, b.id)?.resumeCursors).toEqual({ claude: "b" });
+      }
+      store.forgetRoomMembers(group.id, [b.id]);
+      expect(group).not.toHaveProperty("members");
+      expect(new Store(selection).group(group.id)).not.toHaveProperty("members");
+    });
+
+    it("drops deleted room threads without losing another thread's record", () => {
+      const { store, a, group } = setup();
+      const first = group.threadId;
+      const second = store.createGroupTask(group.id)!.threadId;
+      for (const thread of [first, second]) store.setRoomResumeCursor(thread, a.id, "claude", thread);
+      store.deleteGroupTask(group.id, first);
+      expect(group.members).not.toHaveProperty(first);
+      expect(store.roomMemberRecord(second, a.id)?.resumeCursors.claude).toBe(second);
+      store.forgetRoomThread(second);
+      expect(group).not.toHaveProperty("members");
+    });
+
+    it("refuses writes for non-members and non-room threads", () => {
+      const { store, a, group } = setup();
+      for (const [thread, bot] of [[group.threadId, "outsider"], [a.threadId, a.id]]) {
+        store.setRoomResumeCursor(thread, bot, "claude", "session");
+        store.markRoomMemberDispatched(thread, bot, "claude");
+        store.setRoomHandedMessages(thread, bot, "claude", { session: "session", ids: [] });
+        expect(store.roomMemberRecord(thread, bot)).toBeUndefined();
+      }
+      expect(group).not.toHaveProperty("members");
+    });
+
+    it("skips equal delivery writes and retains only other instances with matching cursors", () => {
+      const { store, a, group } = setup();
+      store.setRoomResumeCursor(group.threadId, a.id, "live", "s");
+      for (const instance of ["live", "stale"]) store.setRoomHandedMessages(group.threadId, a.id, instance, { session: "s", ids: [] });
+      const state = { session: "current", ids: [] };
+      store.setRoomHandedMessages(group.threadId, a.id, "current", state);
+      expect(Object.keys(store.roomMemberRecord(group.threadId, a.id)!.handedMessages!)).toEqual(["live", "current"]);
+      const save = vi.spyOn(store as unknown as { saveGroups(): void }, "saveGroups");
+      store.setRoomHandedMessages(group.threadId, a.id, "current", structuredClone(state));
+      store.forgetRoomMembers(group.id, ["absent"]);
+      store.forgetRoomThread("absent");
+      expect(save).not.toHaveBeenCalled();
+    });
   });
 
   it("commits a confirmed model switch once, preserving siblings and rolling back failed writes", () => {

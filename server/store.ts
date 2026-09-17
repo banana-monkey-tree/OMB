@@ -40,14 +40,43 @@ export type { InstalledPlaybook, InstalledPackageMetadata, MausColor, MausExpres
 /** One transcript line, serialized as stored — the shared wire shape. */
 export type Message = WireMessage;
 
+type AssertExact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
+type AssertSameKeys<A, B> = [keyof A] extends [keyof B] ? ([keyof B] extends [keyof A] ? true : never) : never;
+
+/** One room member's provider state on one room thread: the same pair of
+ * server-private fields a TaskRecord keeps (resume cursor and delivery
+ * record per provider instance), re-keyed for a thread several members read. */
+export interface RoomMemberRecord {
+  resumeCursors: Record<string, unknown>;
+  lastInstanceId?: string;
+  handedMessages?: Record<string, HandedState>;
+}
+
 /** A room record: the shared wire shape minus the computed working flag,
- * which publicGroupState adds at projection time. */
-export type GroupRecord = Omit<WireGroup, "working">;
-/** Groups keep no private fields; the only projection work is the
- * transient `working` flag publicGroupState computes at broadcast time. */
-export type GroupWireProjection = GroupRecord & { working: boolean };
-export type GroupWireProjectionIsExact = AssertExact<WireGroup, GroupWireProjection> & AssertSameKeys<WireGroup, GroupWireProjection>;
+ * which publicGroupState adds at projection time, plus the server-private
+ * member sessions below. */
+export interface GroupRecord extends Omit<WireGroup, "working"> {
+  /** Per room thread id, then per member bot id. Server-private: named in
+   * GroupWirePrivateKeys, so the projection assertion below fails to compile
+   * if it ever becomes client-visible. */
+  members?: Record<string, Record<string, RoomMemberRecord>>;
+}
+
+/** GroupRecord fields no client may see — the room mirror of
+ * TaskWirePrivateKeys. */
+export type GroupWirePrivateKeys = "members";
+export type GroupWireProjection =
+  Pick<GroupRecord, Exclude<keyof GroupRecord, GroupWirePrivateKeys>> & { working: boolean };
+export type GroupWireProjectionIsExact =
+  AssertExact<WireGroup, GroupWireProjection> & AssertSameKeys<WireGroup, GroupWireProjection>;
 export const groupWireProjectionIsExact: GroupWireProjectionIsExact = true;
+
+/** The typed wire projection for one room, minus the transient working flag
+ * publicGroupState computes. Pairs with the assertion above. */
+export function toWireGroup(group: GroupRecord): Omit<WireGroup, "working"> {
+  const { members: _members, ...wire } = group;
+  return wire;
+}
 
 
 // Unicode's complete emoji sequences include flags, skin tones and ZWJ
@@ -78,8 +107,6 @@ export interface TaskRecord extends WireTask {
  * so a new server field forces a decision — wire-visible or private here. */
 export type TaskWirePrivateKeys = "resumeCursors" | "lastInstanceId" | "handedMessages";
 export type TaskWireProjection = Pick<TaskRecord, Exclude<keyof TaskRecord, TaskWirePrivateKeys>>;
-type AssertExact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : never) : never;
-type AssertSameKeys<A, B> = [keyof A] extends [keyof B] ? ([keyof B] extends [keyof A] ? true : never) : never;
 /** Structural exactness alone lets an optional extra field through (a type
  * without the field still extends {field?: T}), so keys are checked too. */
 export type TaskWireProjectionIsExact = AssertExact<WireTask, TaskWireProjection> & AssertSameKeys<WireTask, TaskWireProjection>;
@@ -821,7 +848,7 @@ export class Store {
     );
   }
 
-  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
+  patchGroup(id: string, patch: Partial<Pick<GroupRecord, "name" | "memberIds" | "defaultResponder" | "memberSessions" | "bulletin" | "unread" | "busyBotId" | "cwd" | "pinnedMessageId" | "section" | "setupCompletedAt" | "setupSkippedAt">>): GroupRecord | null {
     const group = this.group(id);
     if (!group) return null;
     if (Object.prototype.hasOwnProperty.call(patch, "section")) {
@@ -991,6 +1018,7 @@ export class Store {
     const group = this.group(groupId);
     if (!group || group.dm || !group.tasks || group.tasks.length < 2) return null;
     if (!group.tasks.some((task) => task.threadId === threadId)) return null;
+    this.forgetRoomThread(threadId);
     group.tasks = group.tasks.filter((task) => task.threadId !== threadId);
     this.deleteThreadRecord(threadId);
     if (group.threadId === threadId) {
@@ -1643,6 +1671,80 @@ export class Store {
       .filter(([id, record]) => id !== instanceId && record.session !== undefined && record.session === task.resumeCursors[id]);
     task.handedMessages = { ...Object.fromEntries(live), [instanceId]: state };
     this.saveBots();
+  }
+
+  /** The server-private record for one member on one room thread. */
+  roomMemberRecord(threadId: string, botId: string): RoomMemberRecord | undefined {
+    return this.groupByThread(threadId)?.members?.[threadId]?.[botId];
+  }
+
+  /** Only a current member can acquire provider state on a room thread. */
+  private ensureRoomMember(threadId: string, botId: string): { group: GroupRecord; record: RoomMemberRecord } | undefined {
+    const group = this.groupByThread(threadId);
+    if (!group || !group.memberIds.includes(botId)) return;
+    const members = group.members ??= {};
+    const thread = members[threadId] ??= {};
+    const record = thread[botId] ??= { resumeCursors: {} };
+    return { group, record };
+  }
+
+  setRoomResumeCursor(threadId: string, botId: string, instanceId: string, cursor: unknown): void {
+    const member = this.ensureRoomMember(threadId, botId);
+    if (!member) return;
+    member.record.resumeCursors[instanceId] = cursor;
+    this.saveGroups();
+  }
+
+  markRoomMemberDispatched(threadId: string, botId: string, instanceId: string): void {
+    const member = this.ensureRoomMember(threadId, botId);
+    if (!member || member.record.lastInstanceId === instanceId) return;
+    member.record.lastInstanceId = instanceId;
+    this.saveGroups();
+  }
+
+  setRoomHandedMessages(threadId: string, botId: string, instanceId: string, state: HandedState): void {
+    const member = this.ensureRoomMember(threadId, botId);
+    if (!member || JSON.stringify(member.record.handedMessages?.[instanceId]) === JSON.stringify(state)) return;
+    const { record } = member;
+    // Other instances keep a record only while it still describes their session.
+    const live = Object.entries(record.handedMessages ?? {})
+      .filter(([id, state]) => id !== instanceId && state.session !== undefined && state.session === record.resumeCursors[id]);
+    record.handedMessages = { ...Object.fromEntries(live), [instanceId]: state };
+    this.saveGroups();
+  }
+
+  /** Rejoining must replay under the access rules then in force, rather
+   * than resume a session that still holds the old membership's context. */
+  forgetRoomMembers(groupId: string, botIds: Iterable<string>): void {
+    const group = this.group(groupId);
+    if (!group?.members) return;
+    const removed = new Set(botIds);
+    let changed = false;
+    for (const [threadId, members] of Object.entries(group.members)) {
+      for (const botId of removed) {
+        if (!Object.hasOwn(members, botId)) continue;
+        delete members[botId];
+        changed = true;
+      }
+      if (Object.keys(members).length === 0) {
+        delete group.members[threadId];
+        changed = true;
+      }
+    }
+    if (Object.keys(group.members).length === 0) {
+      delete group.members;
+      changed = true;
+    }
+    if (changed) this.saveGroups();
+  }
+
+  /** A deleted thread cannot retain any member's session. */
+  forgetRoomThread(threadId: string): void {
+    const group = this.groupByThread(threadId);
+    if (!group?.members || !Object.hasOwn(group.members, threadId)) return;
+    delete group.members[threadId];
+    if (Object.keys(group.members).length === 0) delete group.members;
+    this.saveGroups();
   }
 
   /** Bank one settled turn onto its task. Called once per turn.completed;

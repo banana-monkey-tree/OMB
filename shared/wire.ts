@@ -401,6 +401,13 @@ export interface WireGroup {
   name: string;
   memberIds: string[];
   defaultResponder: GroupDefaultResponder;
+  /** How each member's provider session is handled on this room's threads.
+   * "fresh" (the default, and what every room did before this existed) starts a
+   * new session per turn and replays the room window. "resume" keeps each
+   * member's own session and sends it only the room messages it has not been
+   * handed; anything the harness cannot vouch for falls back to "fresh" for
+   * that turn. */
+  memberSessions?: "fresh" | "resume";
   /** The room's shared instructions. */
   bulletin: string;
   unread: boolean;

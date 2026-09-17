@@ -246,6 +246,7 @@ import {
   type Message,
   type TaskRecord,
   toWireTask,
+  toWireGroup,
 } from "./store.ts";
 import * as tts from "./tts/index.ts";
 import { narrateTool, toUtterances } from "./tts/speech-text.ts";
@@ -2442,6 +2443,13 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
     throw Object.assign(new Error("this channel is working or waiting on you — finish that turn first"), { status: 409 });
   }
   const patch: Record<string, unknown> = {};
+  let removedMembers: string[] = [];
+  if (body.memberSessions !== undefined) {
+    if (body.memberSessions !== "fresh" && body.memberSessions !== "resume") {
+      throw Object.assign(new Error("memberSessions must be fresh or resume"), { status: 400 });
+    }
+    patch.memberSessions = body.memberSessions;
+  }
   if (body.name !== undefined) {
     if (typeof body.name !== "string") throw Object.assign(new Error("room name must be a string"), { status: 400 });
     const name = body.name.trim();
@@ -2481,6 +2489,7 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
     if (removedGoalLead) {
       throw Object.assign(new Error("pause or reassign this room's team-goal routine before removing its lead"), { status: 409 });
     }
+    removedMembers = existing.memberIds.filter((id) => !roster.memberIds.includes(id));
     patch.memberIds = roster.memberIds;
   }
   if (body.defaultResponder !== undefined) {
@@ -2520,6 +2529,7 @@ function updateChannel(groupId: string, value: unknown): GroupRecord {
   }
   const group = store.patchGroup(groupId, patch);
   if (!group) throw Object.assign(new Error("no such room"), { status: 404 });
+  store.forgetRoomMembers(existing.id, removedMembers);
   return group;
 }
 
@@ -2729,7 +2739,7 @@ const roomHandoffs = new RoomHandoffs(join(DATA_DIR, "room-handoffs.json"), {
 }, Date.now, roomHandoffLimits(cfg));
 activeCoordinationForThread = threadId => roomHandoffs.activeDirect(threadId);
 function publicGroupState(group: GroupRecord): WireGroup {
-  return { ...group, working: groupIsWorking(group) || [...roomHandoffs.nodes.values()].some(n => n.groupId === group.id && !["completed", "failed", "cancelled"].includes(n.status)) };
+  return { ...toWireGroup(group), working: groupIsWorking(group) || [...roomHandoffs.nodes.values()].some(n => n.groupId === group.id && !["completed", "failed", "cancelled"].includes(n.status)) };
 }
 
 function beginGroupTurnOperation(

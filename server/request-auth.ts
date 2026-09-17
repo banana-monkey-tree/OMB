@@ -273,7 +273,7 @@ export function clientBotPatchViolation(body: unknown): string | null {
 }
 
 /** Same for a room: name and reading state, never its folder or who answers. */
-const CLIENT_GROUP_PATCH_FIELDS = new Set(["name", "bulletin", "unread", "pinnedMessageId", "section"]);
+const CLIENT_GROUP_PATCH_FIELDS = new Set(["name", "bulletin", "unread", "pinnedMessageId", "section", "memberSessions"]);
 export function clientGroupPatchViolation(body: unknown): string | null {
   if (!body || typeof body !== "object" || Array.isArray(body)) return "body";
   for (const key of Object.keys(body)) if (!CLIENT_GROUP_PATCH_FIELDS.has(key)) return key;
