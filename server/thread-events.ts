@@ -14,24 +14,11 @@
 import { closeSync, fstatSync, openSync, readSync, type Stats } from "node:fs";
 import { join } from "node:path";
 import type { RuntimeEvent } from "./contracts.ts";
+import type { InspectorEntry, InspectorPage, NativeRecord } from "../shared/inspector.ts";
 
-/** One line of native/<threadId>.ndjson (server/drivers/native.ts). */
-export interface NativeRecord {
-  at: string;
-  dir: "in" | "out";
-  source: string;
-  msg: unknown;
-}
-
-export type InspectorEntry =
-  | { kind: "runtime"; at: string; data: RuntimeEvent }
-  | { kind: "native"; at: string; data: NativeRecord };
-
-export interface InspectorPage {
-  entries: InspectorEntry[];
-  /** line counts before the cap, so the UI can say "showing 200 of 1,687" */
-  total: { runtime: number; native: number };
-}
+// The inspector wire shapes live in shared/inspector.ts now (part of the
+// wire model); re-exported here so existing importers keep working.
+export type { InspectorEntry, InspectorPage, NativeRecord } from "../shared/inspector.ts";
 
 const DEFAULT_LIMIT = 300;
 const MAX_LIMIT = 2000;

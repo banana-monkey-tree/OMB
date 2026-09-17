@@ -1,4 +1,4 @@
-import { redactSecretsInText } from "../../server/redact.js";
+import { redactSecretsInText } from "../../shared/redact.js";
 
 /** The persisted message fields this pure projection needs. Keeping this
  * structural avoids pulling the renderer's TSX store into server tests. */

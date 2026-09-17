@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { AppState, Bot, InstanceInfo } from "@/state/store";
-import type { EffortLevel } from "../../server/contracts.ts";
+import type { EffortLevel } from "../../shared/wire";
 
 // The picker reads the engine catalog off the store, and the store module
 // touches window/localStorage at import time — the same shape

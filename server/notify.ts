@@ -18,30 +18,11 @@
 // listening decides what to do with it — desktop and paired-phone local
 // notifications today, and closed-app APNs delivery once a relay exists.
 
-export type NotifyKind =
-  | "approval"
-  | "question"
-  | "done"
-  | "routine-failed"
-  | "routine-deferred"
-  | "turn-failed"
-  | "takeover";
+import type { Notification, NotifyKind } from "../shared/notification.ts";
 
-export interface Notification {
-  kind: NotifyKind;
-  botId: string;
-  botName: string;
-  threadId: string;
-  title: string;
-  body: string;
-  /** The bot's stored profile image, when it has one; clients show it as
-   * the OS notification's icon so every banner carries its bot's face. */
-  avatarUrl?: string;
-  /** The room this came out of, when the bot was speaking in one. Routing
-   * already works off `threadId` alone; this is what lets a client say which
-   * room, and stack a room's banners together instead of under the bot. */
-  groupId?: string;
-}
+// The notification wire shape lives in shared/notification.ts now (part of
+// the wire model); re-exported here so existing importers keep working.
+export type { Notification, NotifyKind } from "../shared/notification.ts";
 
 /** One line, short enough for a lock screen, with the newlines and code
  * fences of a model's answer flattened out of it. */
@@ -112,7 +93,9 @@ export function buildNotification(
               ? `${who}'s routine is waiting`
             : kind === "turn-failed"
               ? `${who} couldn't start`
-              : `${who} finished`;
+              : kind === "incident"
+                ? `${who} hit a problem`
+                : `${who} finished`;
 
   // A "finished" with nothing to say is not worth a notification — the
   // badge in the sidebar already carries that much.

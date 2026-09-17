@@ -25,6 +25,7 @@ import type {
   RuntimeEvent,
   RuntimeEventListener,
   SendTurnInput,
+  SteerOutcome,
 } from "../contracts.ts";
 import { newEventId, newId } from "../contracts.ts";
 import { decodeCodexSelection, readCodexModelCatalog, STATIC_CODEX_MODELS } from "./codex-catalog.ts";
@@ -588,6 +589,11 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
     const listeners = new Set<RuntimeEventListener>();
     interface Turn {
       stop: () => Promise<boolean>;
+      /** Fold new user input into the running native turn (turn/steer).
+       * "refused" when this attempt has nothing steerable; the caller
+       * queues. "indeterminate" when delivery happened but the answer did
+       * not come back — the caller must not re-queue those words. */
+      steer?: (text: string) => Promise<SteerOutcome>;
       turnId: string;
       asks: Map<string, (behavior: "allow" | "deny" | "answer", message?: string, source?: "user" | "timeout" | "system") => void>;
     }
@@ -782,9 +788,31 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         return stopped;
       });
       let completeStoppedTurn: (() => void) | undefined;
+      // Stop asks the app-server to end the turn itself before any process
+      // signal. Killing first surfaced routine stops as "codex exited null
+      // (signal SIGTERM) before turn/completed"; the protocol interrupt keeps
+      // the session the authority, and the kill below is only escalation for
+      // a server that will not answer. settle() runs with state.settled
+      // already true, so ordinary completion still tears down immediately.
+      let interruptRequested = false;
       const stop = async () => {
         stopRequested = true;
         stopSignal.abort();
+        if (!state.settled && !interruptRequested && codexThreadId && codexTurnId &&
+            child.exitCode === null && child.signalCode === null) {
+          interruptRequested = true;
+          const graceMs = Math.max(1, Number(process.env.FAKE_CODEX_INTERRUPT_GRACE_MS ?? 750) || 750);
+          try {
+            await request("turn/interrupt", { threadId: codexThreadId, turnId: codexTurnId }, graceMs);
+          } catch {
+            // Old CLI without the method, or a wedged server: escalate below.
+          }
+          const deadline = Date.now() + graceMs;
+          while (!state.settled && Date.now() < deadline) {
+            await new Promise((wake) => setTimeout(wake, 15));
+          }
+          if (state.settled) return true;
+        }
         const stopped = await terminate();
         if (stopped) completeStoppedTurn?.();
         return stopped;
@@ -804,6 +832,32 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         completeStoppedTurn = complete;
         if (!(await stop())) {
           emit({ ...base(threadId, turnId), type: "runtime.error", message: "codex did not shut down after termination was requested" });
+        }
+      };
+
+      // Live steering folds new input into the running turn without ending
+      // it. expectedTurnId is the protocol's precondition: a turn that moved
+      // on (or a CLI without turn/steer) answers with an explicit RPC error,
+      // which becomes "refused" here so the caller queues for the next turn —
+      // the child is never killed to steer. A timeout after delivery, a dead
+      // transport, or a turn that settles while the answer is in flight is
+      // "indeterminate": the words may already be running, so the caller must
+      // not re-queue them.
+      const steerActiveTurn = async (text: string): Promise<SteerOutcome> => {
+        if (state.settled || abandoned || stopRequested || !codexThreadId || !codexTurnId) return "refused";
+        if (child.exitCode !== null || child.signalCode !== null) return "refused";
+        try {
+          const steerTimeoutMs = Math.max(1, Number(process.env.FAKE_CODEX_STEER_TIMEOUT_MS ?? 10_000) || 10_000);
+          await request("turn/steer", {
+            threadId: codexThreadId,
+            input: [{ type: "text", text }],
+            expectedTurnId: codexTurnId,
+          }, steerTimeoutMs);
+          return "steered";
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (state.settled || message.includes("timed out")) return "indeterminate";
+          return "refused";
         }
       };
 
@@ -1199,6 +1253,13 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
           void stop();
           return;
         }
+        // An intentional stop killed (or outlived) the child before the
+        // turn acknowledged its own end. That is the stop doing its job, not
+        // a crash: settle quietly so Stop never reports the raw signal.
+        if (stopRequested) {
+          void settle(false, "interrupted");
+          return;
+        }
         // The child died before the turn completed. Attribute the exit
         // honestly: name the signal when it was killed, and only quote
         // stderr that arrived after the last protocol message. A stale
@@ -1264,7 +1325,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         void settle(false, "exit_before_result");
       });
 
-      active.set(threadId, { stop, turnId, asks });
+      active.set(threadId, { stop, turnId, asks, steer: steerActiveTurn });
       // Relaunching the app-server is still the same logical turn. Keep the
       // active process current on every attempt, but announce the turn once.
       if (attempt === 0) emit({ ...base(threadId, turnId), type: "turn.started" });
@@ -1317,6 +1378,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         const cursor = typeof turn.resumeCursor === "string" ? turn.resumeCursor : null;
         let startedModel: string | null = null;
         let resumedNativeThread = false;
+        let rebuiltFromReplay = false;
         let promptText = turn.text;
         if (cursor) {
           const resumeThread = () => request("thread/resume", {
@@ -1344,12 +1406,18 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
               promptSubmitted,
               producedOutput: state.sawStreamDelta,
             });
-            if (!config.managed || recoveredMissingSession || stopRequested || state.settled ||
+            if ((!config.managed && !turn.recoveryIsReplay) || recoveredMissingSession || stopRequested || state.settled ||
                 !turn.recoveryText?.trim() || !missingNativeCodexThread(error, cursor) || !mayReplay(failure)) throw error;
-            // The prompt has never been submitted. Rebuild only missing Company
-            // histories, once, through the same approved model/provider below.
+            // The prompt has never been submitted. Rebuild missing Company
+            // histories, and a personal thread only for a turn whose recovery
+            // text is the replay it would have had anyway; once, through the
+            // same approved model/provider below.
             recoveredMissingSession = true;
-            promptText = recoveryPromptFor({ recoveryText: turn.recoveryText, currentText: turn.text, failure }).text;
+            const rebuild = recoveryPromptFor({ recoveryText: turn.recoveryText, currentText: turn.text, failure });
+            // Announced as rebuilt only when the replacement really carries the
+            // replay; otherwise it holds no more than the turn text.
+            rebuiltFromReplay = rebuild.replayed;
+            promptText = rebuild.text;
           }
         }
         if (!codexThreadId) {
@@ -1375,7 +1443,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         }
         if (!codexThreadId) throw new Error("Codex did not return a native thread id");
         await syncCodexInstructions(threadId, codexThreadId, developerInstructions, resumedNativeThread, request);
-        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null });
+        emit({ ...base(threadId, turnId), type: "session.started", sessionId: codexThreadId, model: startedModel ?? turn.model ?? null, ...(rebuiltFromReplay ? { rebuilt: true } : {}) });
         const turnInput = [
           ...(promptText ? [{ type: "text" as const, text: promptText }] : []),
           ...(turn.images ?? []).map((image) => ({ type: "localImage" as const, path: image.path })),
@@ -1503,6 +1571,7 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
       provider: DRIVER_KIND,
       capabilities: {
         sessionModelSwitch: "unsupported",
+        queueing: true,
         computerMcp: true,
         localComputerMcp: true,
         composioMcp: true,
@@ -1513,10 +1582,15 @@ export const CodexDriver: ProviderDriver<CodexConfig> = {
         images: true,
         nativeImageInput: true,
         effortLevels: ["low", "medium", "high", "xhigh", "max"],
+        strictResume: true,
       },
       sendTurn,
       interruptTurn: async (threadId) => {
         await active.get(threadId)?.stop();
+      },
+      steer: async (threadId, text) => {
+        const turn = active.get(threadId);
+        return turn?.steer ? await turn.steer(text) : "refused";
       },
       respondToRequest: async (threadId, requestId, decision) => {
         const turn = active.get(threadId);

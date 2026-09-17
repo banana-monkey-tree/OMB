@@ -1683,116 +1683,87 @@ class Session(
         }
     }
 
-    suspend fun createTask(forBot: Bot, title: String?): Bot? {
-        val activeClient = client ?: return null
+    /**
+     * The one policy behind every task mutation below: offline yields
+     * [offline], cancellation is not an error and propagates, and anything
+     * else is reported as the action error and also yields [offline]. Each
+     * method differs only in its endpoint and the frame that commits its
+     * result, so no Bot-versus-Room copy can drift again. Internal rather
+     * than private only so SessionTaskCrudTest can pin the cancellation
+     * contract directly.
+     */
+    internal suspend fun <T> mutateTask(offline: T, mutation: suspend (CompanionClient) -> T): T {
+        val activeClient = client ?: return offline
         return try {
-            activeClient.createTask(forBot.id, title).also { updated ->
-                _state.update { it.apply(Frame.Bot(updated)) }
-            }
+            mutation(activeClient)
         } catch (error: Throwable) {
+            if (error is CancellationException) throw error
             _actionError.value = error.message
-            null
+            // Cancellation that lands while the failure is being reported
+            // still wins: a cancelled caller throws instead of observing the
+            // offline value.
+            currentCoroutineContext().ensureActive()
+            offline
+        }
+    }
+
+    suspend fun createTask(forBot: Bot, title: String?): Bot? = mutateTask(null) { client ->
+        client.createTask(forBot.id, title).also { updated ->
+            _state.update { it.apply(Frame.Bot(updated)) }
         }
     }
 
     suspend fun switchTask(task: BotTask, forBot: Bot): Bot? {
         if (task.threadId == forBot.threadId) return forBot
-        val activeClient = client ?: return null
-        return try {
-            activeClient.switchTask(forBot.id, task.threadId).also { updated ->
+        return mutateTask(null) { client ->
+            client.switchTask(forBot.id, task.threadId).also { updated ->
                 _state.update { it.apply(Frame.Bot(updated)) }
             }
-        } catch (error: Throwable) {
-            _actionError.value = error.message
-            null
         }
     }
 
-    suspend fun renameTask(task: BotTask, forBot: Bot, title: String): Boolean {
-        val activeClient = client ?: return false
-        return try {
-            activeClient.renameTask(forBot.id, task.threadId, title)
-            refresh()
-            true
-        } catch (error: Throwable) {
-            if (error is CancellationException) throw error
-            _actionError.value = error.message
-            false
+    suspend fun renameTask(task: BotTask, forBot: Bot, title: String): Boolean = mutateTask(false) { client ->
+        client.renameTask(forBot.id, task.threadId, title)
+        refresh()
+        true
+    }
+
+    suspend fun archiveTask(task: BotTask, forBot: Bot, archivedAt: Double?): Boolean = mutateTask(false) { client ->
+        client.setTaskArchived(forBot.id, task.threadId, archivedAt)
+        refresh()
+        true
+    }
+
+    suspend fun deleteTask(task: BotTask, forBot: Bot): Bot? = mutateTask(null) { client ->
+        client.deleteTask(forBot.id, task.threadId).also { updated ->
+            _state.update { it.apply(Frame.Bot(updated)) }
         }
     }
 
-    suspend fun archiveTask(task: BotTask, forBot: Bot, archivedAt: Double?): Boolean {
-        val activeClient = client ?: return false
-        return try {
-            activeClient.setTaskArchived(forBot.id, task.threadId, archivedAt)
-            refresh()
-            true
-        } catch (error: Throwable) {
-            if (error is CancellationException) throw error
-            _actionError.value = error.message
-            false
-        }
-    }
-
-    suspend fun deleteTask(task: BotTask, forBot: Bot): Bot? {
-        val activeClient = client ?: return null
-        return try {
-            activeClient.deleteTask(forBot.id, task.threadId).also { updated ->
-                _state.update { it.apply(Frame.Bot(updated)) }
-            }
-        } catch (error: Throwable) {
-            _actionError.value = error.message
-            null
-        }
-    }
-
-    suspend fun createTask(forRoom: Room, title: String?): Room? {
-        val activeClient = client ?: return null
-        return try {
-            activeClient.createRoomTask(forRoom.id, title).also { updated ->
-                _state.update { it.apply(Frame.Room(updated)) }
-            }
-        } catch (error: Throwable) {
-            _actionError.value = error.message
-            null
+    suspend fun createTask(forRoom: Room, title: String?): Room? = mutateTask(null) { client ->
+        client.createRoomTask(forRoom.id, title).also { updated ->
+            _state.update { it.apply(Frame.Room(updated)) }
         }
     }
 
     suspend fun switchTask(task: BotTask, forRoom: Room): Room? {
         if (task.threadId == forRoom.threadId) return forRoom
-        val activeClient = client ?: return null
-        return try {
-            activeClient.switchRoomTask(forRoom.id, task.threadId).also { updated ->
+        return mutateTask(null) { client ->
+            client.switchRoomTask(forRoom.id, task.threadId).also { updated ->
                 _state.update { it.apply(Frame.Room(updated)) }
             }
-        } catch (error: Throwable) {
-            _actionError.value = error.message
-            null
         }
     }
 
-    suspend fun renameTask(task: BotTask, forRoom: Room, title: String): Boolean {
-        val activeClient = client ?: return false
-        return try {
-            activeClient.renameRoomTask(forRoom.id, task.threadId, title)
-            refresh()
-            true
-        } catch (error: Throwable) {
-            if (error is CancellationException) throw error
-            _actionError.value = error.message
-            false
-        }
+    suspend fun renameTask(task: BotTask, forRoom: Room, title: String): Boolean = mutateTask(false) { client ->
+        client.renameRoomTask(forRoom.id, task.threadId, title)
+        refresh()
+        true
     }
 
-    suspend fun deleteTask(task: BotTask, forRoom: Room): Room? {
-        val activeClient = client ?: return null
-        return try {
-            activeClient.deleteRoomTask(forRoom.id, task.threadId).also { updated ->
-                _state.update { it.apply(Frame.Room(updated)) }
-            }
-        } catch (error: Throwable) {
-            _actionError.value = error.message
-            null
+    suspend fun deleteTask(task: BotTask, forRoom: Room): Room? = mutateTask(null) { client ->
+        client.deleteRoomTask(forRoom.id, task.threadId).also { updated ->
+            _state.update { it.apply(Frame.Room(updated)) }
         }
     }
 

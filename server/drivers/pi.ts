@@ -42,7 +42,8 @@ import type {
   SendTurnInput,
   TurnImageInput,
 } from "../contracts.ts";
-import { EFFORT_LEVELS, newEventId, newId } from "../contracts.ts";
+import { EFFORT_LEVELS } from "../../shared/wire.ts";
+import { newEventId, newId } from "../contracts.ts";
 import {
   decodeInjectId,
   encodeInjectId,

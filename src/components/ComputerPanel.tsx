@@ -30,7 +30,7 @@ import {
 } from "lucide-react";
 import { api, ApiError, currentTaskBot, useStore, type Bot } from "@/state/store";
 import { effectivePlace, isComputerPlace, placeLabelKey } from "@/lib/place";
-import type { CloudBackend } from "../../server/contracts.ts";
+import type { CloudBackend } from "../../shared/wire";
 import { ApiKeyRow } from "./ApiKeys";
 import { cn } from "@/lib/cn";
 import { useCaptionChrome } from "@/components/DesktopCapabilities";

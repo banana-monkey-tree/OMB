@@ -23,14 +23,14 @@ export function targetsForPreparation({ current = false, target, platform = proc
   return targets;
 }
 
-export function parsePrepareBrowserArgs(args = []) {
+export function parsePrepareBrowserArgs(args = [], { platform = process.platform, arch = process.arch } = {}) {
   const options = { current: false };
   for (let index = 0; index < args.length; index += 1) {
     if (args[index] === "--current" && !options.current && !options.target) options.current = true;
     else if (args[index] === "--target" && !options.target && !options.current && args[index + 1]) options.target = args[++index];
     else throw new Error("Usage: node scripts/prepare-browser.mjs [--current | --target PLATFORM-ARCH]");
   }
-  targetsForPreparation(options);
+  targetsForPreparation({ ...options, platform, arch });
   return options;
 }
 

@@ -1,8 +1,8 @@
 // Turning the inspector's two record shapes into one-line summaries. Pure
 // so the panel stays a thin renderer and the labels can be tested.
-import type { RuntimeEvent } from "../../server/contracts.ts";
-import type { InspectorEntry, NativeRecord } from "../../server/thread-events.ts";
-export type { InspectorEntry, InspectorPage, NativeRecord } from "../../server/thread-events.ts";
+import type { RuntimeEvent } from "../../shared/runtime-events";
+import type { InspectorEntry, NativeRecord } from "../../shared/inspector";
+export type { InspectorEntry, InspectorPage, NativeRecord } from "../../shared/inspector";
 
 interface FoldPreview {
   text: string;

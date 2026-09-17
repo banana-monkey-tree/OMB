@@ -507,3 +507,26 @@ it("runs the owed direct follow-up while the same bot works in another thread", 
   await expect.poll(async () => (await chiefTasks()).find((task: any) => task.title === "Independent hold")?.busy, { timeout: 10_000 }).toBe(false);
   expect((await f.messages(f.chief.activeTaskId)).some((message: any) => message.text === "The follow-up ran while the hold worked")).toBe(true);
 }), 45_000);
+
+it("sends each teammate result once in the turn that reviews it", () => fixture(async f => {
+  f.plan[f.lead.id].resumeReply = "LEAD_RESULT_ONCE implemented and verified";
+  await f.start();
+  expect((await f.wait()).status).toBe("settled");
+  const text = String(f.evidence().filter((turn: any) => turn.botId === f.chief.id).at(-1).prompt.message.content);
+  expect(text).toContain("Your downstream room requests have settled.");
+  expect(text.split("LEAD_RESULT_ONCE").length - 1).toBe(1);
+}), 45_000);
+
+it("gives a teammate whose session is rebuilt its second request once, never also as a bare assistant line", () => fixture(async f => {
+  f.plan[f.lead.id] = { reply: "round result" };
+  for (const key of ["first", "second"]) {
+    f.plan[f.chief.id] = { steps: [{ arguments: { bot_ids: [f.lead.id], request_key: key, message: `REQUEST_${key.toUpperCase()} please do it` } }], reply: "Assigned", resumeReply: "Done" };
+    f.save();
+    await f.cli("send", "--bot", f.chief.id, "--task", f.chief.activeTaskId, "--text", `Delegate the ${key} request.`);
+    expect((await f.wait()).status).toBe("settled");
+  }
+  const second = String(f.evidence().filter((turn: any) => turn.botId === f.lead.id).at(-1).prompt.message.content);
+  expect(second.split("REQUEST_SECOND").length - 1).toBe(1);
+  expect(second).toContain("could not be resumed");
+  expect(second).not.toMatch(/^Assistant: @/m);
+}, { FAKE_CLAUDE_MODE: "dead-session" }), 60_000);

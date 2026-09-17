@@ -1,7 +1,7 @@
 // Desktop notifications, driven by the harness's {kind:"notify"} frames.
 // The server decides *whether* something is worth an interruption (it owns
 // the per-bot toggle); this only decides how to show it here.
-import type { Notification } from "../../server/notify.ts";
+import type { Notification } from "../../shared/notification";
 
 export type NotifyFrame = Notification;
 

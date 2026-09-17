@@ -6,13 +6,21 @@
 // readable.
 
 import type { ApprovalMode } from "../shared/approval-mode.ts";
-import type { AskQuestion } from "../shared/ask-question.ts";
+import type { EffortLevel } from "../shared/wire.ts";
+import type {
+  DriverKind, InstanceId, ModelVariantOption, RuntimeEventListener, ThreadId, TurnId,
+} from "../shared/runtime-events.ts";
 
-export type DriverKind = string;
-export type InstanceId = string;
-export type ThreadId = string;
-export type TurnId = string;
-export type CloudBackend = "box" | "vps";
+// These contract types live in shared/wire.ts now (part of the wire model);
+// re-exported here so existing server-side importers keep working.
+export type { CloudBackend, EffortLevel, ModelSelection } from "../shared/wire.ts";
+// Runtime-event wire shapes live in shared/runtime-events.ts now (part of
+// the wire model); re-exported here so existing importers keep working.
+export type {
+  DriverKind, InstanceId, ModelVariantOption, ModelVariantState, RuntimeEvent,
+  RuntimeEventBase, RuntimeEventListener, ThreadId, TurnId,
+} from "../shared/runtime-events.ts";
+
 
 export type ProviderErrorCode =
   | "missing_cli"
@@ -32,15 +40,6 @@ export class ProviderError extends Error {
   }
 }
 
-/** Reasoning-effort levels, ascending. A union of everything any engine
- * accepts; each driver declares the subset its CLI will take. */
-export const EFFORT_LEVELS = ["none", "low", "medium", "high", "xhigh", "max"] as const;
-export type EffortLevel = (typeof EFFORT_LEVELS)[number];
-
-/** Narrow untrusted API/config input before it becomes a model selection. */
-export function isEffortLevel(value: unknown): value is EffortLevel {
-  return typeof value === "string" && (EFFORT_LEVELS as readonly string[]).includes(value);
-}
 
 /** Variants are opaque provider IDs, not the cross-engine effort enum. */
 export function isModelVariant(value: unknown): value is string {
@@ -48,27 +47,9 @@ export function isModelVariant(value: unknown): value is string {
     value.trim() === value && !/\p{Cc}/u.test(value);
 }
 
-export interface ModelVariantOption {
-  id: string;
-  label: string;
-}
-
-export interface ModelVariantState {
-  options: ModelVariantOption[];
-  currentValue?: string;
-}
-
 // ── model selection ────────────────────────────────────────────────────
 // "Which model" is a data value carried on the request, never a service
 // binding (upstream ModelSelectionWire). instanceId is the routing key.
-export interface ModelSelection {
-  instanceId: InstanceId;
-  model: string;
-  /** Optional: no effort means no flag, and the CLI keeps its own default. */
-  effort?: EffortLevel;
-  /** Explicit model-specific variant. Omitted leaves the native session alone. */
-  variant?: string;
-}
 
 /** An image already admitted to OpenMausBot's private attachment store.
  * Drivers receive this structured value instead of learning a host path from
@@ -95,120 +76,6 @@ export interface InstanceConfig {
 export type InstanceConfigMap = Record<InstanceId, InstanceConfig>;
 
 // ── canonical runtime events ───────────────────────────────────────────
-// Subset of upstream's 49-member ProviderRuntimeEvent union — the ~12 types
-// the recipe says to start with, sharing one base. `raw` carries the
-// native protocol message when a consumer needs to see behind the
-// normalization.
-export interface RuntimeEventBase {
-  eventId: string;
-  provider: DriverKind;
-  providerInstanceId?: InstanceId;
-  threadId: ThreadId;
-  createdAt: string;
-  turnId?: TurnId;
-  itemId?: string;
-  requestId?: string;
-  raw?: { source: string; payload: unknown };
-}
-
-export type RuntimeEvent = RuntimeEventBase &
-  (
-    | { type: "session.started"; sessionId: string | null; model?: string | null }
-    | { type: "session.model-variants"; model: string; variants: ModelVariantState }
-    | { type: "session.exited"; reason?: string }
-    | { type: "turn.started" }
-    | {
-        type: "turn.retrying";
-        /** 1-based: the retry about to be launched (1 = first relaunch). */
-        attempt: number;
-        delayMs: number;
-        /** Why this failure was judged retry-worthy (classifyError's reason). */
-        reason: string;
-      }
-    | {
-        type: "turn.completed";
-        ok: boolean;
-        stopReason?: string | null;
-        cost?: number | null;
-        denials?: string[];
-        /** THIS turn's token total, as the provider reports it at the end.
-         * The one figure the harness accumulates — thread.token-usage.updated
-         * is a live indicator whose meaning differs per driver (a per-call
-         * delta, a thread total, a per-step figure) and must never be summed. */
-        usage?: { input: number; output: number; cachedInput?: number };
-      }
-    | {
-        type: "item.started";
-        itemType: "tool" | "reasoning";
-        title?: string;
-        /** The shell command the call runs, on one redacted line of at most
-         * 200 characters, for the chip and the Verify card. Absent for calls
-         * that run no command (a Read, a fetch). */
-        summary?: string;
-        /** Bounded, redacted display preview; never raw tool arguments. */
-        input?: string;
-      }
-    | { type: "item.updated"; itemType: "tool" | "reasoning"; tokens?: number | null }
-    | { type: "item.completed"; itemType: "tool"; ok: boolean; output?: string }
-    | { type: "item.completed"; itemType: "assistant_text"; text: string }
-    /** Provider-generated raster bytes. This event is folded into the
-     * private attachment store and is never forwarded to renderer SSE: a
-     * multi-megabyte base64 result belongs in one durable message URL, not
-     * duplicated through every connected window. */
-    | { type: "item.completed"; itemType: "assistant_image"; data: string; alt?: string }
-    | { type: "content.delta"; streamKind: "assistant_text" | "reasoning_text"; delta: string }
-    | {
-        type: "request.opened";
-        requestType: "permission" | "question";
-        tool: string;
-        summary: string;
-        choices?: string[];
-        /** A provider's structured ask (Claude's AskUserQuestion): the whole
-         * set of questions, each with its own options, so the card can offer
-         * them instead of an Allow/Deny a person cannot answer. */
-        questions?: AskQuestion[];
-        approvalScope?: "local-computer";
-        /** Provider asks to widen its configured sandbox. Only explicit Full
-         * access may answer this automatically; Auto/remembered grants may not. */
-        requiresExplicitApproval?: boolean;
-        /** Whether the provider's own automatic reviewer was running when it
-         * raised this request. Only providers that can tell set it: Claude
-         * reports the effective permission mode in its init frame, and starts
-         * in Manual without a word when Auto is unavailable for the model.
-         * "inactive" means this ask is not a reviewer's verdict, so the app's
-         * own safe-Auto rules may answer it; unset means nobody knows. */
-        nativeReview?: "active" | "inactive";
-        /** The provider can keep an allow for the rest of its session
-         * ("Always allow this session"): Claude through its own suggested
-         * permission rules, ACP agents through `allow_always` or the
-         * driver's per-session memory. Unset when answers are one-shot. */
-        allowSession?: boolean;
-      }
-    | {
-        type: "request.resolved";
-        behavior: "allow" | "deny" | "answer";
-        /** who decided: a person, auto mode, the ask's own timeout, the
-         * harness (turn ended / settings changed), or nobody — the answerer
-         * was already gone and the action never ran */
-        source: "user" | "auto" | "timeout" | "system" | "unavailable" | "peer";
-        approvalScope?: "local-computer";
-      }
-    | {
-        type: "thread.token-usage.updated"; input: number; output: number; cachedInput?: number;
-        /** What the model's window held on the most recent model call — the
-         * whole prompt, cache reads included — and the window's size when the
-         * driver knows it. The figure that predicts the next message's cost. */
-        contextTokens?: number; contextWindow?: number;
-      }
-    // `setup: true` marks a failure the user fixes by installing or
-    // configuring something, not by retrying — the UI offers setup instead.
-    // `terminal: true` records failure of the complete turn, rather than a
-    // transient error or a legacy provider's diagnostic during cancellation.
-    | { type: "runtime.error"; message: string; setup?: boolean; terminal?: boolean }
-  );
-
-export type RuntimeEventListener = (event: RuntimeEvent) => void;
-
 /** What became of an answer to an ask. `allowed-once` grants only the
  * asked-about action — broadening ("always allow") stays a separate,
  * explicit step. `unavailable` is the fail-closed default: no answerer,
@@ -247,6 +114,10 @@ export interface SendTurnInput {
    * prompt (server/resume-recovery.ts) — so a session the provider lost
    * does not brick the thread, and the new session is not blank. */
   recoveryText?: string;
+  /** recoveryText is the replay this turn would have been sent without a
+   * resume cursor (it carries an update from outside the session). A driver
+   * that rebuilds only some lost sessions may also rebuild this one. */
+  recoveryIsReplay?: boolean;
   /** Prior turns for transcript-replay providers (API-backed drivers). */
   transcript?: Array<{ role: "user" | "assistant"; text: string }>;
   /** Bot persona (name/title/description) as a system prompt. */
@@ -394,6 +265,13 @@ export interface ProviderAdapter {
      * MCP servers from config). Same rule as composioMcp: an entry in the
      * config says the servers exist, not that this engine can reach them. */
     customMcp?: boolean;
+    /** True when a turn given a resumeCursor runs in that exact native
+     * session, or, if the provider refuses the session before accepting the
+     * prompt, fails or starts a new session from recoveryText — never a blank
+     * session that silently lacks the history; session.started says `rebuilt`
+     * for that new session. The harness then keeps such a session across
+     * externally appended messages and sends only those. */
+    strictResume?: boolean;
   };
   sendTurn(input: SendTurnInput): Promise<TurnStartResult>;
   interruptTurn(threadId: ThreadId, turnId?: TurnId): Promise<void>;
@@ -415,14 +293,25 @@ export interface ProviderAdapter {
       always?: boolean;
     },
   ): Promise<RequestOutcome>;
-  /** Deliver a user message into the RUNNING turn on this thread. Resolves
-   * false when there is no live turn to steer (the caller then sends it as
-   * a normal turn). Only drivers with `capabilities.queueing` implement it. */
-  steer?(threadId: ThreadId, text: string): Promise<boolean>;
+  /** Deliver a user message into the RUNNING turn on this thread. Only
+   * drivers with `capabilities.queueing` implement it.
+   *
+   * - "steered" — the engine accepted the input into the live turn.
+   * - "refused" — provably NOT delivered (no live turn, explicit RPC
+   *   refusal, failed stdin write): the caller may queue it for the next
+   *   turn without risk of running it twice.
+   * - "indeterminate" — delivered, but the outcome is unknown (the RPC
+   *   timed out after accept, transport failed, or the turn settled while
+   *   the answer was in flight). The caller must NOT re-queue: the words
+   *   may already be running, and replaying them would execute them twice. */
+  steer?(threadId: ThreadId, text: string): Promise<SteerOutcome>;
   hasSession(threadId: ThreadId): boolean;
   stopAll(): Promise<void>;
   onEvent(listener: RuntimeEventListener): () => void;
 }
+
+/** The tri-state result of Adapter.steer — see the contract above. */
+export type SteerOutcome = "steered" | "refused" | "indeterminate";
 
 // ── provider snapshot (upstream ServerProviderShape, reduced) ────────────
 export interface ProviderSnapshot {

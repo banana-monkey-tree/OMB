@@ -52,7 +52,6 @@ struct ChatView: View {
     @State private var fileDownloadTask: Task<Void, Never>?
     @State private var fileDownloadRequestID: UUID?
     @State private var threadOpenTask: Task<Void, Never>?
-    @State private var acceptsNextHardwareLineBreak = false
     @FocusState private var composerFocused: Bool
     @StateObject private var dictation = SpeechDictation()
     /// The opening beat: the island grows with the bot's face in it, then
@@ -263,6 +262,7 @@ struct ChatView: View {
                     }
                     .frame(maxWidth: .infinity, alignment: .top)
                     .ignoresSafeArea(edges: .top)
+                    .allowsHitTesting(false)
                 }
                 .task {
                     // grow, hold a beat, shrink — the face rides along
@@ -379,7 +379,6 @@ struct ChatView: View {
             attachments = restored.attachments
             attachmentError = restored.error
             selectedPhotos = []
-            acceptsNextHardwareLineBreak = false
             showCommandHUD = false
             showingPlus = false
             // The local task picker changed threads. A download
@@ -463,8 +462,8 @@ struct ChatView: View {
 
     // MARK: - Header
 
-    /// Back on the left with the rest-of-app unread count, the bot's
-    /// computer on the right — a blurred strip to the top edge.
+    /// Back on the left with the rest-of-app unread count, threads and the
+    /// bot's computer on the right — a blurred strip to the top edge.
     private var headerBar: some View {
         HStack(alignment: .top) {
             Button { dismiss() } label: {
@@ -491,13 +490,30 @@ struct ChatView: View {
 
             Spacer(minLength: 4)
 
-            if case .bot = current {
-                GlassButton(systemImage: "display", size: 44, weight: .medium) {
-                    showingComputer = true
+            HStack(spacing: 8) {
+                if current.supportsTasks {
+                    Button {
+                        showingTasks = true
+                    } label: {
+                        Label("Threads", systemImage: "square.stack")
+                            .font(.system(size: 14, weight: .medium))
+                            .foregroundStyle(Color.primary)
+                            .padding(.horizontal, 12)
+                            .frame(height: 44)
+                            .contentShape(Capsule())
+                    }
+                    .buttonStyle(.plain)
+                    .glassCapsule()
+                    .accessibilityIdentifier("header-threads")
                 }
-                .accessibilityLabel("Watch \(current.name)'s computer")
-            } else {
-                Color.clear.frame(width: 44, height: 44)
+                if case .bot = current {
+                    GlassButton(systemImage: "display", size: 44, weight: .medium) {
+                        showingComputer = true
+                    }
+                    .accessibilityLabel("Watch \(current.name)'s computer")
+                } else {
+                    Color.clear.frame(width: 44, height: 44)
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -571,7 +587,6 @@ struct ChatView: View {
             }
             .buttonStyle(.plain)
             .glassCapsule()
-            .disabled(preparingAttachments || sendingMessage)
             .accessibilityLabel(current.supportsTasks ? "Switch thread: \(current.threadTitle)" : "Open \(current.name) thread options")
             .accessibilityHint("Choose a conversation or start a new thread")
             .accessibilityIdentifier("thread-switcher")
@@ -742,29 +757,6 @@ struct ChatView: View {
     private var canSend: Bool {
         (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
             && !preparingAttachments && !sendingMessage
-    }
-
-    /// A vertically growing SwiftUI TextField treats the software keyboard's
-    /// Return key as a newline even when the key is labelled “Send”. Intercept
-    /// that proposed edit before it reaches the draft. Hardware Shift-Return
-    /// opts into one real line break through `acceptsNextHardwareLineBreak`.
-    private var composerDraft: Binding<String> {
-        Binding(
-            get: { draft },
-            set: { proposed in
-                if acceptsNextHardwareLineBreak {
-                    acceptsNextHardwareLineBreak = false
-                    draft = proposed
-                } else if ComposerKeyboard.shouldSubmit(
-                    previousText: draft,
-                    proposedText: proposed
-                ) {
-                    submit()
-                } else {
-                    draft = proposed
-                }
-            }
-        )
     }
 
     private var hasPendingApproval: Bool {
@@ -1208,7 +1200,7 @@ struct ChatView: View {
 
                         TextField(
                             sendingMessage ? "Sending…" : dictation.isListening ? "Listening…" : "Ask \(current.name)",
-                            text: composerDraft,
+                            text: $draft,
                             axis: .vertical
                         )
                             .lineLimit(1...5)
@@ -1216,7 +1208,6 @@ struct ChatView: View {
                             .padding(.vertical, 11)
                             .focused($composerFocused)
                             .accessibilityIdentifier("message-input")
-                            .submitLabel(.send)
                             // Partial transcripts rebuild from a frozen base;
                             // prevent competing edits without dimming the text.
                             .allowsHitTesting(
@@ -1228,16 +1219,16 @@ struct ChatView: View {
                                     showCommandHUD = value.hasPrefix("/")
                                 }
                             }
+                            // The software keyboard's Return inserts a newline,
+                            // like Messages; only the arrow button sends. A
+                            // hardware Return still sends, Shift-Return breaks
+                            // the line. onKeyPress never sees the software
+                            // keyboard, so this cannot turn its Return into a send.
                             .onKeyPress(.return, phases: .down) { press in
-                                if press.modifiers.contains(.shift) {
-                                    acceptsNextHardwareLineBreak = true
-                                    return .ignored
-                                }
-                                acceptsNextHardwareLineBreak = false
+                                if press.modifiers.contains(.shift) { return .ignored }
                                 submit()
                                 return .handled
                             }
-                            .onSubmit { submit() }
 
                         Button {
                             composerFocused = false
@@ -1277,7 +1268,11 @@ struct ChatView: View {
                         .animation(.easeOut(duration: 0.15), value: canSend)
                     }
                     .frame(minHeight: 44)
-                    .glassCapsule(interactive: false)
+                    // A capsule at one line (44pt tall, 22pt corners) that
+                    // keeps those 22pt corners as the draft grows, the way
+                    // Messages does. A true Capsule would round to half the
+                    // height, and a five-line draft became a giant pill.
+                    .glassSheet(cornerRadius: 22)
                 }
             }
         }

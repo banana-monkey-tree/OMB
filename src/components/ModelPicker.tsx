@@ -7,7 +7,8 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, ChevronDown, ChevronLeft, ChevronRight, Loader2, RefreshCw, Search } from "lucide-react";
 import { useStore, currentTaskBot, type Bot, type InstanceInfo, type ModelSelection } from "@/state/store";
-import type { EffortLevel, ModelVariantOption } from "../../server/contracts.ts";
+import type { EffortLevel } from "../../shared/wire";
+import type { ModelVariantOption } from "../../shared/runtime-events";
 import { filterCustomModels, partitionCustomModels, suggestedModels } from "@/lib/custom-models";
 import { isCustomOnly, splitEngineRail } from "@/lib/engine-rail";
 import { ProviderMark } from "./ProviderIcons";

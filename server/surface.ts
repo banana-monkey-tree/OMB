@@ -8,7 +8,8 @@
 
 /** A place a bot can act. `cloud` covers both the Box and VPS backends —
  * from the person's seat they are the same "cloud computer" panel. */
-export type Surface = "cloud" | "vm" | "local" | "browser";
+import type { Surface } from "../shared/wire.ts";
+export type { Surface };
 
 /** The bot's "Works on" setting; undefined = Auto. */
 export type Destination = Surface | "off" | undefined;

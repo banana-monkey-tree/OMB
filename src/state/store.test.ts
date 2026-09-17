@@ -23,7 +23,7 @@ import {
   type Action,
 } from "./store";
 import { openLiveEvents, type LiveEventSourceLike, type LiveEventsPlatform } from "../lib/live-events";
-import type { RuntimeEvent, ModelVariantState } from "../../server/contracts.ts";
+import type { ModelVariantState, RuntimeEvent } from "../../shared/runtime-events";
 import type { RoutineRun } from "../lib/routines";
 
 describe("screen frame ownership", () => {

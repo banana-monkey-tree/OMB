@@ -325,23 +325,24 @@ describe("finding the browser engine", () => {
   it("mounts the bundled browser with no download and keeps explicit Chrome overrides", async () => {
     const resources = mkdtempSync(join(tmpdir(), "omb-browser-resources-"));
     scratch.push(resources);
+    const host = { platform: "linux" as const, arch: "x64" };
     const env = { OMB_RESOURCES_PATH: resources, PATH: "" };
-    const bundle = browserBundlePaths(join(resources, "browser-engine"), `${process.platform}-${process.arch}`);
+    const bundle = browserBundlePaths(join(resources, "browser-engine"), "linux-x64");
     mkdirSync(bundle.licenses, { recursive: true });
     for (const file of [bundle.engine, bundle.chrome, bundle.manifest]) {
       mkdirSync(join(file, ".."), { recursive: true });
       writeFileSync(file, "fixture, not executable");
     }
-    expect(browserEngineStatus({ env })).toMatchObject({ kind: "ready", binaryPath: bundle.engine });
-    const spec = agentBrowserIntegration({ binaryPath: bundle.engine, session: "isolated", encryptionKey: "key", env });
+    expect(browserEngineStatus({ env, ...host })).toMatchObject({ kind: "ready", binaryPath: bundle.engine });
+    const spec = agentBrowserIntegration({ binaryPath: bundle.engine, session: "isolated", encryptionKey: "key", env, ...host });
     expect(spec.env.AGENT_BROWSER_EXECUTABLE_PATH).toBe(bundle.chrome);
     expect(spec.env.AGENT_BROWSER_SESSION).toBe("isolated");
     expect(spec.env.AGENT_BROWSER_NO_WEBMCP).toBe("1");
     expect(spec.env).not.toHaveProperty("OMB_RESOURCES_PATH");
-    const override = agentBrowserIntegration({ binaryPath: bundle.engine, session: "isolated", encryptionKey: "key", env: { ...env, AGENT_BROWSER_EXECUTABLE_PATH: "/explicit/chrome" } });
+    const override = agentBrowserIntegration({ binaryPath: bundle.engine, session: "isolated", encryptionKey: "key", env: { ...env, AGENT_BROWSER_EXECUTABLE_PATH: "/explicit/chrome" }, ...host });
     expect(override.env.AGENT_BROWSER_EXECUTABLE_PATH).toBe("/explicit/chrome");
     // A spawn would fail because the fixture engine is not executable.
-    await expect(ensureChrome(bundle.engine, { env })).resolves.toBeUndefined();
+    await expect(ensureChrome(bundle.engine, { env, ...host })).resolves.toBeUndefined();
   });
 
   it("prefers the explicit path, then the pinned download, then PATH, and reports why when nothing is there", () => {

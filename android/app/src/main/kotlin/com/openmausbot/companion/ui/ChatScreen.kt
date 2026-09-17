@@ -1,5 +1,6 @@
 package com.openmausbot.companion.ui
 
+import android.view.KeyCharacterMap
 import androidx.activity.compose.BackHandler
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.foundation.rememberScrollState
@@ -38,8 +39,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.List
@@ -91,7 +90,6 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -1618,22 +1616,23 @@ private fun Composer(
                             color = MaterialTheme.colorScheme.onSurface,
                         ),
                         cursorBrush = SolidColor(MaterialTheme.colorScheme.onSurface),
-                        // Software keyboards have no Shift+Return, so their Return key
-                        // is a send — which is what the Send action promises.
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                        keyboardActions = KeyboardActions(onSend = { onSend() }),
+                        // The software keyboard's Return breaks the line, like
+                        // Messages; the arrow button on the bar is the one send.
+                        // A hardware Return still sends and Shift+Return breaks
+                        // the line. Some soft keyboards deliver their Return as a
+                        // key event too, so the rule also asks where it came from.
                         modifier = Modifier
                             .fillMaxWidth()
-                            // Return sends, Shift+Return breaks the line — the shape
-                            // every chat app has on a hardware keyboard.
                             .onPreviewKeyEvent { event ->
-                                val isReturn = event.key == Key.Enter || event.key == Key.NumPadEnter
-                                if (event.type == KeyEventType.KeyDown && isReturn && !event.isShiftPressed) {
-                                    onSend()
-                                    true
-                                } else {
-                                    false
-                                }
+                                val sends = ComposerReturn.sends(
+                                    isReturnKey = event.key == Key.Enter || event.key == Key.NumPadEnter,
+                                    keyDown = event.type == KeyEventType.KeyDown,
+                                    shift = event.isShiftPressed,
+                                    fromSoftwareKeyboard =
+                                        event.nativeKeyEvent.deviceId == KeyCharacterMap.VIRTUAL_KEYBOARD,
+                                )
+                                if (sends) onSend()
+                                sends
                             },
                     )
                 }

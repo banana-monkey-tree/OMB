@@ -8,7 +8,8 @@ import { z } from "zod";
 import { normalizeImageGenerationUrl, type ImageGenerationConfig } from "../shared/image-generation.ts";
 
 import { writeFileAtomic } from "./atomic.ts";
-import { EFFORT_LEVELS, isModelVariant, type InstanceConfigMap, type ModelSelection } from "./contracts.ts";
+import { EFFORT_LEVELS } from "../shared/wire.ts";
+import { isModelVariant, type InstanceConfigMap, type ModelSelection } from "./contracts.ts";
 import type { McpServerSpec } from "./contracts.ts";
 import { isRemoteMcpServer, parseStoredMcpServer } from "./mcp-registry.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
@@ -21,6 +22,9 @@ const BROWSER_PROFILE_ID = /^[a-z0-9_-]{1,40}$/;
 export const DEFAULT_ROOM_TURN_TIMEOUT_MINUTES = 5;
 export const MIN_ROOM_TURN_TIMEOUT_MINUTES = 1;
 export const MAX_ROOM_TURN_TIMEOUT_MINUTES = 1_440;
+export const DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES = 30;
+export const DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES = 10;
+export const DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES = 240;
 export const DEFAULT_MAX_CONCURRENT_BOT_THREADS = 3;
 export const MAX_CONCURRENT_BOT_THREADS = 10;
 /** Bounds for threads.eventLogMaxBytes: the floor keeps the kept tail large
@@ -62,7 +66,19 @@ const roomConfigSchema = z.object({
     .int()
     .min(MIN_ROOM_TURN_TIMEOUT_MINUTES)
     .max(MAX_ROOM_TURN_TIMEOUT_MINUTES),
-});
+  /** Room handoff tree lifetime. Active execution pauses this clock; the
+   * hard cap is wall-clock and bounds trees that never stop executing. */
+  handoffLifetimeMinutes: z.number().int().min(1).max(MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+  handoffMinRunwayMinutes: z.number().int().min(1).max(MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+  handoffHardCapMinutes: z.number().int().min(1).max(7 * MAX_ROOM_TURN_TIMEOUT_MINUTES).optional(),
+}).refine(
+  (rooms) =>
+    (rooms.handoffMinRunwayMinutes ?? DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES) <=
+      (rooms.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) &&
+    (rooms.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) <=
+      (rooms.handoffHardCapMinutes ?? DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES),
+  { message: "rooms handoff bounds must satisfy handoffMinRunwayMinutes <= handoffLifetimeMinutes <= handoffHardCapMinutes" },
+);
 const localVmConfigSchema = z.object({
   mode: z.enum(["shared", "per-bot"]).optional(),
   maxInstances: z
@@ -373,6 +389,9 @@ const appConfigSchema = z.object({
     /** Cap each per-thread events/ and native/ NDJSON log at this many
      * bytes; absent (the default) keeps today's unbounded growth (#1280). */
     eventLogMaxBytes: z.number().int().min(MIN_THREAD_EVENT_LOG_BYTES).max(MAX_THREAD_EVENT_LOG_BYTES).optional(),
+    /** Days a closed or archived thread's event logs survive (#1280).
+     * Absent keeps them forever. */
+    eventLogRetentionDays: z.number().int().min(1).max(3650).optional(),
   }).strict().optional(),
   localVm: localVmConfigSchema.optional(),
   features: featureConfigSchema.optional(),
@@ -416,8 +435,8 @@ export interface AppConfig {
   tts?: { key?: string; fishKey?: string; voice?: string; provider?: "elevenlabs" | "fish" | "system" | "chatterbox"; baseUrl?: string; model?: string };
   imageGen?: ImageGenerationConfig;
   profile?: { name?: string; email?: string };
-  rooms?: { turnTimeoutMinutes: number };
-  threads?: { maxConcurrentPerBot: number; eventLogMaxBytes?: number };
+  rooms?: { turnTimeoutMinutes: number; handoffLifetimeMinutes?: number; handoffMinRunwayMinutes?: number; handoffHardCapMinutes?: number };
+  threads?: { maxConcurrentPerBot: number; eventLogMaxBytes?: number; eventLogRetentionDays?: number };
   /** Shared preserves the historical singleton. Per-bot gives every bot a
    * separate container, durable workspace, viewer and lease. */
   localVm?: { mode?: "shared" | "per-bot"; maxInstances?: number };
@@ -542,6 +561,23 @@ export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
   return cfg.rooms?.turnTimeoutMinutes ?? DEFAULT_ROOM_TURN_TIMEOUT_MINUTES;
 }
 
+export interface RoomHandoffLimitsMs {
+  lifetimeMs: number;
+  minRunwayMs: number;
+  hardCapMs: number;
+}
+
+/** Room handoff tree budgets in milliseconds. The tree lifetime pauses
+ * while a node is actively executing; the hard cap is wall-clock and bounds
+ * trees that never stop. Read when the server starts. */
+export function roomHandoffLimits(cfg: AppConfig): RoomHandoffLimitsMs {
+  return {
+    lifetimeMs: (cfg.rooms?.handoffLifetimeMinutes ?? DEFAULT_ROOM_HANDOFF_LIFETIME_MINUTES) * 60_000,
+    minRunwayMs: (cfg.rooms?.handoffMinRunwayMinutes ?? DEFAULT_ROOM_HANDOFF_MIN_RUNWAY_MINUTES) * 60_000,
+    hardCapMs: (cfg.rooms?.handoffHardCapMinutes ?? DEFAULT_ROOM_HANDOFF_HARD_CAP_MINUTES) * 60_000,
+  };
+}
+
 export function maxConcurrentBotThreads(cfg: AppConfig): number {
   return cfg.threads?.maxConcurrentPerBot ?? DEFAULT_MAX_CONCURRENT_BOT_THREADS;
 }
@@ -551,6 +587,13 @@ export function maxConcurrentBotThreads(cfg: AppConfig): number {
 export function threadEventLogMaxBytes(cfg: AppConfig): number | null {
   const cap = cfg.threads?.eventLogMaxBytes;
   return typeof cap === "number" && Number.isFinite(cap) && cap > 0 ? cap : null;
+}
+
+/** Days a closed or archived bot thread's event logs survive before the
+ * retention sweep removes them (#1280). Null — the default — keeps them
+ * forever. */
+export function threadEventLogRetentionDays(cfg: AppConfig): number | null {
+  return cfg.threads?.eventLogRetentionDays ?? null;
 }
 
 export function localVmMode(cfg: AppConfig): "shared" | "per-bot" {
@@ -888,6 +931,25 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
     }
     disk.instances = diskInstances;
   }
+  // Settings edits the workspace connection. Older fleet saves could freeze
+  // its inherited URL in the default instance, sending a replacement key to
+  // the previous endpoint. An explicit URL save reconnects that shared-key
+  // instance; custom connections and explicit instance patches stay intact.
+  if (checkedPatch.openaiCompat?.url !== undefined && checkedPatch.instances?.openaiCompat === undefined) {
+    const instances = jsonObjectSchema.safeParse(disk.instances);
+    const entry = jsonObjectSchema.safeParse(instances.success ? instances.data.openaiCompat : undefined);
+    const config = jsonObjectSchema.safeParse(entry.success ? entry.data.config : undefined);
+    const environment = jsonObjectSchema.safeParse(entry.success ? entry.data.environment : undefined);
+    if (entry.success && entry.data.driver === "openai-compat" && config.success
+      && !config.data.key
+      && (!config.data.apiKeyEnv || config.data.apiKeyEnv === "OPENAI_COMPAT_API_KEY")
+      && !(environment.success && Object.hasOwn(environment.data, "OPENAI_COMPAT_API_KEY"))) {
+      const nextConfig = { ...config.data };
+      delete nextConfig.url;
+      // Preserve raw extension fields elsewhere in this saved instance.
+      (disk.instances as JsonObject).openaiCompat = { ...entry.data, config: nextConfig };
+    }
+  }
   mkdirSync(DATA_DIR, { recursive: true });
   writeFileAtomic(p, JSON.stringify(disk, null, 2), { mode: 0o600 });
 }
@@ -929,13 +991,16 @@ export function withInstanceCli(
   return { ok: true, config: next };
 }
 
-/** Materialize defaults without copying injected workspace secrets to disk. */
+/** Materialize defaults without freezing injected workspace settings or secrets. */
 export function persistableInstanceConfigs(cfg: AppConfig): InstanceConfigMap {
   const map = instanceConfigs(cfg);
   for (const [id, entry] of Object.entries(map)) {
     const environment = cfg.instances?.[id]?.environment;
     if (environment) entry.environment = { ...environment };
     else delete entry.environment;
+    const config = cfg.instances?.[id]?.config;
+    if (config !== undefined) entry.config = structuredClone(config);
+    else delete entry.config;
   }
   return map;
 }

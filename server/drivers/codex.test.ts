@@ -128,6 +128,12 @@ describe("CodexDriver turns (fake app-server)", () => {
     delete process.env.FAKE_CODEX_INSTRUCTIONS;
     delete process.env.FAKE_CODEX_RESUME_ERROR;
     delete process.env.FAKE_CODEX_START_ERROR;
+    delete process.env.FAKE_CODEX_STEER_ERROR;
+    delete process.env.FAKE_CODEX_STEER_ERROR_FILE;
+    delete process.env.FAKE_CODEX_STEER_HANG;
+    delete process.env.FAKE_CODEX_STEER_TIMEOUT_MS;
+    delete process.env.FAKE_CODEX_INTERRUPT_SILENT;
+    delete process.env.FAKE_CODEX_INTERRUPT_GRACE_MS;
     delete process.env.OPENAI_API_KEY;
     delete process.env.BOX_TOKEN;
     delete process.env.OMB_TTS_KEY;
@@ -919,7 +925,34 @@ describe("CodexDriver turns (fake app-server)", () => {
     });
     expect(seen.argv).toContain('model_provider="openmaus_company"');
     expect(JSON.stringify(seen.argv)).not.toContain("synthetic-company-fixture");
-    expect(recorder.events.filter((event) => event.type === "session.started")).toMatchObject([{ sessionId: "codex-thread-1" }]);
+    expect(recorder.events.filter((event) => event.type === "session.started")).toMatchObject([{ sessionId: "codex-thread-1", rebuilt: true }]);
+  });
+
+  it("rebuilds a missing personal thread only for a turn whose recovery text is the replay it would have had", async () => {
+    await create();
+    const dump = join(scratch, "personal-missing-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    const recoveryText = "[This conversation received an update outside your provider session.]\nUser: go";
+    await instance.adapter.sendTurn({ threadId: "t-personal-replay", text: "go", resumeCursor: "gone-thread", recoveryText, recoveryIsReplay: true });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(calls.find((call: { method: string }) => call.method === "turn/start").params.input).toEqual([{ type: "text", text: recoveryText }]);
+    expect(recorder.events.filter((e) => e.type === "session.started")).toMatchObject([{ rebuilt: true }]);
+  });
+
+  it("does not announce a rebuilt Company thread when the recovery text is the turn itself", async () => {
+    await create({ managed: true });
+    const dump = join(scratch, "company-no-replay.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await instance.adapter.sendTurn({
+      threadId: "company-no-replay", text: "Continue", resumeCursor: "gone-company-thread",
+      recoveryText: "Continue", model: "company-codex-model",
+    });
+    await expect(recorder.until((event) => event.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    const calls = JSON.parse(readFileSync(dump, "utf8")).calls;
+    expect(calls.map((call: { method: string }) => call.method)).toContain("thread/start");
+    expect(recorder.events.filter((event) => event.type === "session.started").at(-1)).not.toMatchObject({ rebuilt: true });
   });
 
   it("keeps successful Company resumes native without replaying the canonical transcript", async () => {
@@ -1403,6 +1436,140 @@ describe("CodexDriver turns (fake app-server)", () => {
     await instance.adapter.interruptTurn("t-busy");
     await recorder.until((e) => e.type === "turn.completed");
   });
+
+  it("steers the running turn through turn/steer without killing the child", async () => {
+    const dump = join(scratch, "codex-steer.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await create({ mode: "approval" }); // parks the turn open mid-flight
+    expect(instance.adapter.capabilities.queueing).toBe(true);
+
+    await instance.adapter.sendTurn({ threadId: "t-codex-steer", text: "one" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    await expect(instance.adapter.steer?.("t-codex-steer", "and also this")).resolves.toBe("steered");
+
+    const snapshot = JSON.parse(readFileSync(dump, "utf8"));
+    expect(snapshot.calls.find((c: any) => c.method === "turn/steer")?.params).toEqual({
+      threadId: "codex-thread-1",
+      input: [{ type: "text", text: "and also this" }],
+      expectedTurnId: "turn-1",
+    });
+    // steering is mid-turn input, never a kill: the child survives it
+    expect(processIsAlive(snapshot.pid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+
+    // the steered turn still settles through its own protocol flow
+    await instance.adapter.respondToRequest("t-codex-steer", opened.requestId!, { behavior: "deny" });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    await expect.poll(() => processIsAlive(snapshot.pid), { timeout: 5_000 }).toBe(false);
+  }, 20_000);
+
+  it("reports an explicitly refused steer as refused so the caller queues, and keeps the child alive", async () => {
+    const dump = join(scratch, "codex-steer-refused.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_STEER_ERROR = JSON.stringify({ code: -32000, message: "active turn is not steerable" });
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-steer-refused", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await expect(instance.adapter.steer?.("t-codex-steer-refused", "queued words")).resolves.toBe("refused");
+    expect(processIsAlive(JSON.parse(readFileSync(dump, "utf8")).pid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+
+    await instance.adapter.interruptTurn("t-codex-steer-refused");
+    await recorder.until((e) => e.type === "turn.completed");
+  }, 20_000);
+
+  it("a refused steer queues, and the follow-up turn needs no mid-turn kill", async () => {
+    // killCliTree legitimately reaps the catalog probe and a finished turn server;
+    // a queue path must never kill the child that owns the running turn.
+    const dump = join(scratch, "codex-queue-nokill.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    process.env.FAKE_CODEX_STEER_ERROR = JSON.stringify({ code: -32000, message: "active turn is not steerable" });
+    const kills = vi.spyOn(procs, "killCliTree");
+    const killed = (pid: number) => kills.mock.calls.some((c: any[]) => c[0]?.pid === pid);
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-queue-nokill", text: "one" });
+    const opened = await recorder.until((e) => e.type === "request.opened");
+    const turnPid = JSON.parse(readFileSync(dump, "utf8")).pid;
+    // the queue trigger is a refused steer: the turn child stays alive, unkilled
+    await expect(instance.adapter.steer?.("t-codex-queue-nokill", "queued words")).resolves.toBe("refused");
+    expect(killed(turnPid)).toBe(false);
+    expect(processIsAlive(turnPid)).toBe(true);
+    await instance.adapter.respondToRequest("t-codex-queue-nokill", opened.requestId!, { behavior: "deny" });
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({ ok: true });
+    // the drained queue runs as its own turn: fresh child, still no mid-turn kill
+    await instance.adapter.sendTurn({ threadId: "t-codex-queue-nokill", text: "queued words" });
+    await recorder.until((e) => e.type === "turn.started");
+    // the fresh app-server writes its dump pid only once it serves a message.
+    // Take the pid from inside the wait: a second, un-polled read here raced
+    // the fake's next rewrite of the dump and blew up on Windows.
+    let drainPid = turnPid;
+    await expect.poll(() => (drainPid = JSON.parse(readFileSync(dump, "utf8")).pid), { timeout: 5_000 }).not.toBe(turnPid);
+    expect(killed(drainPid)).toBe(false);
+    expect(processIsAlive(drainPid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+    await instance.adapter.interruptTurn("t-codex-queue-nokill");
+    await recorder.until((e) => e.type === "turn.completed");
+    kills.mockRestore();
+  }, 20_000);
+
+  it("steer is refused with no running turn", async () => {
+    await create();
+    await expect(instance.adapter.steer?.("t-codex-idle", "hi")).resolves.toBe("refused");
+  });
+
+  it("a steer that times out after delivery is indeterminate, never a re-queueable refusal", async () => {
+    const dump = join(scratch, "codex-steer-hang.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    // The fake accepts turn/steer and never answers: delivery happened, the
+    // reply is lost. Re-queueing these words would run them twice.
+    process.env.FAKE_CODEX_STEER_HANG = "1";
+    process.env.FAKE_CODEX_STEER_TIMEOUT_MS = "150";
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-steer-hang", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await expect(instance.adapter.steer?.("t-codex-steer-hang", "maybe folded words")).resolves.toBe("indeterminate");
+    // nothing was killed and no error surfaced: the turn keeps running
+    expect(processIsAlive(JSON.parse(readFileSync(dump, "utf8")).pid)).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+
+    await instance.adapter.interruptTurn("t-codex-steer-hang");
+    await recorder.until((e) => e.type === "turn.completed");
+  }, 20_000);
+
+  it("Stop interrupts through the protocol and reports no signal error", async () => {
+    const dump = join(scratch, "codex-interrupt.json");
+    process.env.FAKE_CODEX_DUMP = dump;
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-stop-clean", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await instance.adapter.interruptTurn("t-codex-stop-clean");
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({
+      ok: false,
+      stopReason: "interrupted",
+    });
+    expect(JSON.parse(readFileSync(dump, "utf8")).calls.some((c: any) => c.method === "turn/interrupt")).toBe(true);
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  }, 20_000);
+
+  it("escalates to a kill when the server ignores turn/interrupt, still without the signal error", async () => {
+    process.env.FAKE_CODEX_DUMP = join(scratch, "codex-interrupt-silent.json");
+    process.env.FAKE_CODEX_INTERRUPT_SILENT = "1";
+    process.env.FAKE_CODEX_INTERRUPT_GRACE_MS = "60";
+    await create({ mode: "approval" });
+    await instance.adapter.sendTurn({ threadId: "t-codex-stop-wedged", text: "one" });
+    await recorder.until((e) => e.type === "request.opened");
+
+    await instance.adapter.interruptTurn("t-codex-stop-wedged");
+    await expect(recorder.until((e) => e.type === "turn.completed")).resolves.toMatchObject({
+      ok: false,
+      stopReason: "interrupted",
+    });
+    expect(recorder.events.some((e) => e.type === "runtime.error")).toBe(false);
+  }, 20_000);
 
   it.each([false, true])("keeps ownership after an uncertain stop even when root close arrives (before failure: %s)", async (closeFirst) => {
     await create();

@@ -108,6 +108,8 @@ teammate can delegate work to this bot without downgrading its explicit Auto
 | Antigravity | Native `default` | Native `auto_edit` | Legacy `auto` behaves as Ask; UI Auto selects Full access | Native `yolo` plus automatic approval of remaining tool-permission requests; shown as Auto |
 | Grok Build | Native `default` | Native `acceptEdits` | Native `--permission-mode auto`; availability of Grok's reviewer depends on its feature rollout | Native `bypassPermissions` plus automatic approval of remaining tool-permission requests |
 | OpenCode | Ask | not offered | Ask | Approve individual ACP permission requests, never task questions |
+| Qwen Code | Native `default` | Native `--approval-mode auto-edit` | Native `--approval-mode auto` (Qwen's LLM classifier approves safe actions, blocks risky ones) | `--yolo`, plus automatic approval of remaining ACP permission requests |
+| Gemini CLI | Native `default` | Native `--approval-mode auto_edit` | Ask (no reviewer) | `--yolo`, plus automatic approval of remaining ACP permission requests |
 | Other/custom engines | Ask | not offered | Ask | Not offered until a provider mapping is implemented |
 
 These settings apply on each turn, including resumed conversations. Switching
