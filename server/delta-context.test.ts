@@ -363,3 +363,126 @@ describe("randomized record sequences", () => {
     });
   }
 });
+
+describe("room threads", () => {
+  const setup = () => {
+    // Leave an unseen message before the replies so credits remain explicit ids.
+    const order = ["unseen", "a-reply", "b-reply"];
+    const records = new Map<string, HandedState>([
+      ["A", { session: "session-A", ids: [] }],
+      ["B", { session: "session-B", ids: [] }],
+    ]);
+    const replyOwners: string[] = [];
+    const handoffs = new Handoffs({
+      order: () => order,
+      read: (botId) => records.get(botId),
+      write: (botId, _threadId, _instanceId, state) => { records.set(botId, state); },
+      replies: (_threadId, turnId, botId) => {
+        replyOwners.push(botId);
+        // The turn itself names its stored reply; attribution must come from
+        // the pending handoff, not whichever member most recently began.
+        return turnId === "turn-A" ? ["a-reply"] : turnId === "turn-B" ? ["b-reply"] : [];
+      },
+    });
+    const begin = (botId: string, claimId = `claim-${botId}`) => {
+      handoffs.begin("t", claimId, {
+        botId, instanceId: "claude", config: "c", resumeCursor: `session-${botId}`,
+        started: { sent: [] }, recovery: { sent: [] }, resumed: { sent: [] },
+        placed: [], carried: [], own: [],
+      });
+      handoffs.dispatching("t", claimId);
+    };
+    const event = (extra: Record<string, unknown>) => handoffs.onEvent({
+      eventId: "e", provider: "claudeAgent", providerInstanceId: "claude", threadId: "t", createdAt: "", ...extra,
+    } as RuntimeEvent);
+    const complete = (botId: string) => event({ type: "turn.completed", turnId: `turn-${botId}`, ok: true });
+    return { records, replyOwners, handoffs, begin, event, complete };
+  };
+
+  it("does not credit one member's record with another member's reply", () => {
+    const f = setup();
+    f.begin("A");
+    f.handoffs.bindTurn("t", "claim-A", "turn-A");
+    f.begin("B");
+    f.complete("A");
+    expect(f.records.get("B")!.ids).not.toContain("a-reply");
+    expect(f.records.get("A")!.ids).toContain("a-reply");
+    expect(f.replyOwners).toEqual(["A"]);
+  });
+
+  it("credits each member's own reply to its own record", () => {
+    const f = setup();
+    for (const botId of ["A", "B"]) {
+      f.begin(botId);
+      f.handoffs.bindTurn("t", `claim-${botId}`, `turn-${botId}`);
+    }
+    expect(f.complete("B")).toEqual({ botId: "B", instanceId: "claude" });
+    expect(f.complete("A")).toEqual({ botId: "A", instanceId: "claude" });
+    expect(f.records.get("A")!.ids).toEqual(["a-reply"]);
+    expect(f.records.get("B")!.ids).toEqual(["b-reply"]);
+    expect(f.replyOwners).toEqual(["B", "A"]);
+  });
+
+  it("matches nothing when two unbound members share a thread and instance", () => {
+    const f = setup();
+    f.begin("A");
+    f.begin("B");
+    expect(f.event({ type: "session.started", sessionId: "ambiguous" })).toBeUndefined();
+    expect(f.complete("A")).toBeUndefined();
+    expect(f.records.get("A")).toEqual({ session: "session-A", ids: [] });
+    expect(f.records.get("B")).toEqual({ session: "session-B", ids: [] });
+    expect(f.replyOwners).toEqual([]);
+    expect(f.handoffs.current("t")).toBeUndefined();
+  });
+
+  it("keeps a single 1:1 pending per thread", () => {
+    const f = setup();
+    f.begin("A", "old");
+    const old = f.handoffs.current("t");
+    f.begin("A", "new");
+    expect(f.handoffs.current("t")).toBeDefined();
+    expect(f.handoffs.current("t")).not.toBe(old);
+    f.handoffs.abandon("t", "old");
+    f.handoffs.bindTurn("t", "new", "turn-A");
+    f.complete("A");
+    expect(f.records.get("A")!.ids).toEqual(["a-reply"]);
+    expect(f.handoffs.current("t")).toBeUndefined();
+  });
+
+  it("abandons only the named claim and forgets every member on the thread", () => {
+    const f = setup();
+    f.begin("A");
+    f.begin("B");
+    f.handoffs.abandon("t", "claim-A");
+    expect(f.complete("B")).toEqual({ botId: "B", instanceId: "claude" });
+    f.begin("A");
+    f.begin("B");
+    f.handoffs.forget("t");
+    expect(f.complete("A")).toBeUndefined();
+    expect(f.complete("B")).toBeUndefined();
+  });
+
+  it("keeps matching a lone handoff on an event that carries no turn id", () => {
+    // Keying by member must not narrow the private-thread case. Nothing in
+    // RuntimeEvent requires a turn id, and a session.started that stopped
+    // matching once the turn was bound would leave the record of the session
+    // that was just replaced in place, to be trusted by the next turn.
+    const f = setup();
+    f.begin("A");
+    f.handoffs.bindTurn("t", "claim-A", "turn-A");
+    expect(f.event({ type: "session.started", sessionId: "replacement" }))
+      .toEqual({ botId: "A", instanceId: "claude" });
+    expect(f.records.get("A")).toEqual({ ids: [] });
+  });
+
+  it("returns the member identity for every matched session.started branch", () => {
+    const f = setup();
+    f.begin("A");
+    const identity = { botId: "A", instanceId: "claude" };
+    expect(f.event({ type: "session.started" })).toEqual(identity);
+    expect(f.event({ type: "session.started", sessionId: "session-A" })).toEqual(identity);
+    expect(f.event({ type: "session.started", sessionId: "session-A" })).toEqual(identity);
+    f.event({ type: "content.delta", turnId: "turn-A", streamKind: "assistant_text", delta: "hi" });
+    expect(f.event({ type: "session.started", turnId: "turn-A", sessionId: "ignored-after-accept" })).toEqual(identity);
+  });
+});

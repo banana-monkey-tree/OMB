@@ -5003,12 +5003,24 @@ function isContextMessage(m: Message): boolean {
   return Boolean((m.kind === "text" && m.text) || m.roomRequest?.phase === "result");
 }
 
+/** A room thread is read by every member, so its delivery records live on the
+ * room, keyed by member, and a member's own replies are the ones the fan-out
+ * stamped with its id — a room bot message always carries `from`
+ * (see the group branch of pushMessage). */
+const isRoomThread = (threadId: string) => Boolean(store.groupByThread(threadId));
+
 const handoffs = new Handoffs({
   order: (threadId) => store.activePath(threadId).filter(isContextMessage).map((m) => m.id),
-  read: (botId, threadId, instanceId) => store.taskByThread(botId, threadId)?.handedMessages?.[instanceId],
-  write: (botId, threadId, instanceId, state) => store.setHandedMessages(botId, threadId, instanceId, state),
-  replies: (threadId, turnId) => store.activePath(threadId)
-    .filter((m) => m.role === "bot" && m.kind === "text" && !m.from && m.turnId === turnId).map((m) => m.id),
+  read: (botId, threadId, instanceId) => isRoomThread(threadId)
+    ? store.roomMemberRecord(threadId, botId)?.handedMessages?.[instanceId]
+    : store.taskByThread(botId, threadId)?.handedMessages?.[instanceId],
+  write: (botId, threadId, instanceId, state) => isRoomThread(threadId)
+    ? store.setRoomHandedMessages(threadId, botId, instanceId, state)
+    : store.setHandedMessages(botId, threadId, instanceId, state),
+  replies: (threadId, turnId, botId) => store.activePath(threadId)
+    .filter((m) => m.role === "bot" && m.kind === "text" && m.turnId === turnId &&
+      (isRoomThread(threadId) ? m.from?.botId === botId : !m.from))
+    .map((m) => m.id),
 });
 
 /** Consume one delegated-turn watch and mirror exactly one terminal state.

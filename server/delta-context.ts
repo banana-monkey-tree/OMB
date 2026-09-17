@@ -190,8 +190,8 @@ export interface HandoffStore {
   order(threadId: string): string[];
   read(botId: string, threadId: string, instanceId: string): HandedState | undefined;
   write(botId: string, threadId: string, instanceId: string, state: HandedState): void;
-  /** the stored replies a provider turn produced itself */
-  replies(threadId: string, turnId: string): string[];
+  /** the stored replies a provider turn produced itself, for that bot */
+  replies(threadId: string, turnId: string, botId: string): string[];
 }
 
 /** What one direct turn puts in front of a strict-resume provider. */
@@ -220,6 +220,7 @@ export interface Handoff {
 }
 
 interface PendingHandoff extends Handoff {
+  threadId: string;
   claimId: string;
   dispatched: boolean;
   turnId?: string;
@@ -254,35 +255,63 @@ export class Handoffs {
     this.store = store;
   }
 
+  private static key(threadId: string, botId: string): string {
+    return `${threadId}\u0000${botId}`;
+  }
+
+  private forThread(threadId: string): PendingHandoff[] {
+    return [...this.pending.values()].filter((pending) => pending.threadId === threadId);
+  }
+
+  /** The handoff an event belongs to. A private thread has one, and the rule
+   * for it is the one that was always here: a bound turn id that is not the
+   * event's rules the event out, and anything else matches. A room thread has
+   * one per member currently speaking, commonly on a single provider instance,
+   * so there only a bound turn id can say which member an event belongs to; an
+   * event that names none belongs to nobody. A handoff credited with nothing
+   * simply replays, while crediting the wrong member is the one failure that
+   * loses a message instead of repeating it. */
+  private match(event: RuntimeEvent): PendingHandoff | undefined {
+    const candidates = this.forThread(event.threadId)
+      .filter((pending) => pending.dispatched && pending.instanceId === event.providerInstanceId);
+    if (candidates.length === 1) {
+      const only = candidates[0];
+      return only.turnId && event.turnId && event.turnId !== only.turnId ? undefined : only;
+    }
+    const bound = candidates.filter((pending) => pending.turnId === event.turnId);
+    return event.turnId && bound.length === 1 ? bound[0] : undefined;
+  }
+
   /** Registered when the turn claims the thread, before any provider work. */
   begin(threadId: string, claimId: string, handoff: Handoff): void {
-    this.pending.set(threadId, {
-      ...handoff, claimId, dispatched: false, replaced: false, rebuilt: false, accepted: false, stopped: false, steers: [],
+    this.pending.set(Handoffs.key(threadId, handoff.botId), {
+      ...handoff, threadId, claimId, dispatched: false, replaced: false, rebuilt: false, accepted: false, stopped: false, steers: [],
     });
   }
 
   /** The thread is gone. */
   forget(threadId: string): void {
-    this.pending.delete(threadId);
+    for (const pending of this.forThread(threadId)) this.pending.delete(Handoffs.key(threadId, pending.botId));
   }
 
   /** Just before sendTurn: an adapter may emit the whole turn before it
    * resolves. `update` carries what setup changed in the handoff. */
   dispatching(threadId: string, claimId: string, update?: Partial<Handoff>): void {
-    const pending = this.pending.get(threadId);
-    if (pending?.claimId !== claimId) return;
+    const pending = this.forThread(threadId).find((pending) => pending.claimId === claimId);
+    if (!pending) return;
     Object.assign(pending, update);
     pending.dispatched = true;
   }
 
   bindTurn(threadId: string, claimId: string, turnId: string | undefined): void {
-    const pending = this.pending.get(threadId);
-    if (pending?.claimId === claimId) pending.turnId ??= turnId;
+    const pending = this.forThread(threadId).find((pending) => pending.claimId === claimId);
+    if (pending) pending.turnId ??= turnId;
   }
 
   /** The handoff a steer is about to go into; pass it back to `steered`. */
   current(threadId: string): object | undefined {
-    return this.pending.get(threadId);
+    const pending = this.forThread(threadId);
+    return pending.length === 1 ? pending[0] : undefined;
   }
 
   /** A message written into the running turn. No provider reports reading
@@ -290,48 +319,51 @@ export class Handoffs {
    * never counted as received: the next turn offers it again, marked, unless
    * the person stops this turn. */
   steered(threadId: string, target: object | undefined, instanceId: string | undefined, messageId: string): void {
-    const pending = this.pending.get(threadId);
+    const candidates = this.forThread(threadId);
+    const pending = candidates.length === 1 ? candidates[0] : undefined;
     if (!pending || pending !== target || pending.instanceId !== instanceId) return;
     pending.steers.push(messageId);
   }
 
   /** The person pressed Stop: what they sent into this turn is withdrawn. */
   stoppedByPerson(threadId: string): void {
-    const pending = this.pending.get(threadId);
+    const candidates = this.forThread(threadId);
+    const pending = candidates.length === 1 ? candidates[0] : undefined;
     if (pending) pending.stopped = true;
   }
 
   /** The turn ended before dispatch completed. */
   abandon(threadId: string, claimId: string): void {
-    const pending = this.pending.get(threadId);
-    if (pending?.claimId !== claimId) return;
-    this.pending.delete(threadId);
+    const pending = this.forThread(threadId).find((pending) => pending.claimId === claimId);
+    if (!pending) return;
+    this.pending.delete(Handoffs.key(threadId, pending.botId));
     this.settle(threadId, pending);
   }
 
-  onEvent(event: RuntimeEvent): void {
-    const pending = this.pending.get(event.threadId);
-    if (!pending?.dispatched || event.providerInstanceId !== pending.instanceId) return;
-    if (pending.turnId && event.turnId && event.turnId !== pending.turnId) return;
+  onEvent(event: RuntimeEvent): { botId: string; instanceId: string } | undefined {
+    const pending = this.match(event);
+    if (!pending) return undefined;
+    const identity = { botId: pending.botId, instanceId: pending.instanceId };
     if (event.type === "session.started") {
-      if (!event.sessionId || event.sessionId === pending.session || pending.accepted) return;
+      if (!event.sessionId || event.sessionId === pending.session || pending.accepted) return identity;
       pending.session = event.sessionId;
       pending.replaced = event.sessionId !== pending.resumeCursor;
       pending.rebuilt = event.rebuilt === true;
       // Nothing the old session held is trusted for its replacement.
       if (pending.replaced) this.store.write(pending.botId, event.threadId, pending.instanceId, { ids: [] });
-      return;
+      return identity;
     }
     if ((actedOn(event) || (event.type === "turn.completed" && event.ok)) && !pending.accepted) {
       pending.accepted = true;
       pending.turnId ??= event.turnId;
       this.accept(event.threadId, pending);
     }
-    if (event.type !== "turn.completed") return;
-    this.pending.delete(event.threadId);
+    if (event.type !== "turn.completed") return identity;
+    this.pending.delete(Handoffs.key(event.threadId, pending.botId));
     const turnId = event.turnId ?? pending.turnId;
-    if (pending.accepted && turnId) this.add(event.threadId, pending, this.store.replies(event.threadId, turnId));
+    if (pending.accepted && turnId) this.add(event.threadId, pending, this.store.replies(event.threadId, turnId, pending.botId));
     this.settle(event.threadId, pending);
+    return identity;
   }
 
   private settle(threadId: string, pending: PendingHandoff): void {
