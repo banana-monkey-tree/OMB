@@ -134,6 +134,7 @@ import {
   persistableInstanceConfigs,
   type AppConfig,
   vpsSshAlias,
+  browserEngineAttachCdpUrl,
   DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
@@ -1250,6 +1251,7 @@ async function browserIntegration(botId: string, profile: string | undefined, tu
       encryptionKey: browserEngineEncryptionKey(),
       persistent: profile !== "guest",
       env: { ...process.env, PATH: augmentedPath() },
+      attachCdpUrl: browserEngineAttachCdpUrl(cfg) ?? undefined,
     });
   await prepareBrowserSessionState(status.binaryPath, session, { env: spec.env, persistent: profile !== "guest", isCurrent: () => {
     const current = store.bot(botId);
