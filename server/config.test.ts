@@ -34,6 +34,7 @@ import { customMcpServers,
   stripWorkspaceCredentialEnv,
   syncCredentialEnv,
   vpsSshAlias,
+  browserEngineAttachCdpUrl,
   withInstanceCli,
   WORKSPACE_CREDENTIAL_ENV,
   type AppConfig,
@@ -391,6 +392,25 @@ describe("configuration boundaries", () => {
     });
     expect(vpsSshAlias({ vps: { sshAlias: "production-vps" } })).toBe("production-vps");
     expect(vpsSshAlias({ vps: { sshAlias: "-bad" } })).toBeNull();
+  });
+
+  it("validates browserEngine.attachCdpUrl as a bare CDP port or an http(s)/ws(s) URL, and forwards it only when configured", () => {
+    // Unset: behaves exactly as before the field existed.
+    expect(parseStoredConfig({})).toEqual({});
+    expect(browserEngineAttachCdpUrl({})).toBeNull();
+    // Valid forms round-trip through both the stored-file and PATCH schemas.
+    for (const value of ["9333", "1", "65535", "http://127.0.0.1:9333", "https://cdp.internal:9333/", "ws://127.0.0.1:9333/devtools/browser/abc"]) {
+      expect(parseStoredConfig({ browserEngine: { attachCdpUrl: value } })).toEqual({ browserEngine: { attachCdpUrl: value } });
+      expect(parseConfigPatch({ browserEngine: { attachCdpUrl: value } })).toEqual({ browserEngine: { attachCdpUrl: value } });
+      expect(browserEngineAttachCdpUrl({ browserEngine: { attachCdpUrl: value } })).toBe(value);
+    }
+    // Invalid values are rejected with a clear, field-named error rather than silently ignored.
+    for (const value of ["0", "70000", "not-a-url", "ftp://127.0.0.1:9333", "javascript:alert(1)"]) {
+      expect(() => parseConfigPatch({ browserEngine: { attachCdpUrl: value } })).toThrow("browserEngine.attachCdpUrl");
+    }
+    // An empty string clears the setting (same convention as tts.baseUrl, vps.sshAlias).
+    expect(parseConfigPatch({ browserEngine: { attachCdpUrl: "" } })).toEqual({ browserEngine: { attachCdpUrl: "" } });
+    expect(browserEngineAttachCdpUrl({ browserEngine: { attachCdpUrl: "" } })).toBeNull();
   });
 
   it("accepts a persisted global room turn timeout and supplies the legacy default", () => {

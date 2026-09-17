@@ -35,6 +35,8 @@ import {
 import { approvalHeldNote, approvalHeldReason, approvalModeForOrigin, autoVerdict, deliverFullAccessApproval, delegationInheritsFullAccess } from "./auto-approve.ts";
 import { updateClaudeCli } from "./claude-update.ts";
 import { configuredAccountDirectory, assertSeparateClaudeAccount, claudeAccountInfo, createClaudeAccountSchema, instanceSettingsSchema, newClaudeAccount } from "./claude-accounts.ts";
+import { providerIconPatchSchema, withInstanceIcon } from "./provider-icon.ts";
+import { providerIconError } from "../shared/provider-icon.ts";
 import {
   BrowserCleanupCoordinator,
   finalizeBrowserCleanupMutation,
@@ -134,6 +136,7 @@ import {
   persistableInstanceConfigs,
   type AppConfig,
   vpsSshAlias,
+  browserEngineAttachCdpUrl,
   DATA_DIR,
   EVENTS_DIR,
   NATIVE_DIR,
@@ -1250,6 +1253,7 @@ async function browserIntegration(botId: string, profile: string | undefined, tu
       encryptionKey: browserEngineEncryptionKey(),
       persistent: profile !== "guest",
       env: { ...process.env, PATH: augmentedPath() },
+      attachCdpUrl: browserEngineAttachCdpUrl(cfg) ?? undefined,
     });
   await prepareBrowserSessionState(status.binaryPath, session, { env: spec.env, persistent: profile !== "guest", isCurrent: () => {
     const current = store.bot(botId);
@@ -10199,19 +10203,20 @@ function persistMcpServers(next: Record<string, unknown>): void {
 async function describeInstances() {
   const configs = instanceConfigs(cfg);
   return (await registry.describe()).map((instance) => {
+    const entry = configs[instance.instanceId];
+    const described = entry?.icon ? { ...instance, icon: entry.icon } : instance;
     if (managedDesktop.owns(instance.instanceId)) return {
-      ...instance, readOnly: true, managed: managedDesktop.info(instance.instanceId),
+      ...described, readOnly: true, managed: managedDesktop.info(instance.instanceId),
       install: undefined, authentication: undefined, cli: undefined, cliCandidates: [],
     };
-    const entry = configs[instance.instanceId];
-    if (entry?.driver !== "claudeAgent") return instance;
+    if (entry?.driver !== "claudeAgent") return described;
     try {
       const claudeAccount = claudeAccountInfo(instance.instanceId, entry, instance.cli ?? instance.cliDefault ?? "claude");
-      return { ...instance, claudeAccount, install: { ...instance.install, signInCommand: claudeAccount.signInCommand } };
+      return { ...described, claudeAccount, install: { ...instance.install, signInCommand: claudeAccount.signInCommand } };
     } catch {
       // A malformed saved config remains a repairable shadow, never takes
       // the model picker down or offers a login for the wrong directory.
-      return { ...instance, install: { ...instance.install, signInCommand: undefined } };
+      return { ...described, install: { ...instance.install, signInCommand: undefined } };
     }
   });
 }
@@ -16352,6 +16357,32 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse) => {
     }
     const companyMutation = /^\/api\/instances\/(company\.[\w.-]+)(?:\/|$)/.exec(path);
     if (companyMutation && method !== "GET") return json(res, 403, { error: "Company accounts are read-only here. Manage this connection in desktop Settings." });
+
+    const instanceIconPatch = /^\/api\/instances\/([\w.-]+)\/icon$/.exec(path);
+    if (method === "PATCH" && instanceIconPatch) {
+      if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {
+        return json(res, 415, { error: "content-type must be application/json" });
+      }
+      const parsed = providerIconPatchSchema.safeParse(await readBody(req, 192 * 1024));
+      if (!parsed.success) {
+        const detail = parsed.error.issues[0]?.message;
+        return json(res, 400, { error: detail && detail !== "Invalid input" ? detail : "Choose a built-in icon or upload a PNG, JPEG, or WebP image up to 128 KB." });
+      }
+      if (parsed.data.icon) {
+        const invalid = providerIconError(parsed.data.icon);
+        if (invalid) return json(res, 400, { error: invalid });
+      }
+      if (providerConfigBusy) return json(res, 409, { error: "provider settings are already being updated" });
+      providerConfigBusy = true;
+      try {
+        const changed = withInstanceIcon(cfg, instanceIconPatch[1], parsed.data.icon);
+        if (!changed.ok) return json(res, 404, { error: `unknown instance "${instanceIconPatch[1]}"` });
+        saveConfig({ instances: changed.instances }, { replaceInstances: true });
+        cfg.instances = changed.instances;
+        broadcast({ kind: "config", ...configStatus() });
+        return json(res, 200, { instances: await describeInstances() });
+      } finally { providerConfigBusy = false; }
+    }
 
     if (method === "POST" && path === "/api/instances/claude-accounts") {
       if (!String(req.headers["content-type"] ?? "").toLowerCase().startsWith("application/json")) {

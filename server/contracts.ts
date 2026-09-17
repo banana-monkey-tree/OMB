@@ -10,6 +10,7 @@ import type { EffortLevel } from "../shared/wire.ts";
 import type {
   DriverKind, InstanceId, ModelVariantOption, RuntimeEventListener, ThreadId, TurnId,
 } from "../shared/runtime-events.ts";
+import type { ProviderIcon } from "../shared/provider-icon.ts";
 
 // These contract types live in shared/wire.ts now (part of the wire model);
 // re-exported here so existing server-side importers keep working.
@@ -68,6 +69,9 @@ export interface InstanceConfig {
   driver: DriverKind;
   displayName?: string;
   accentColor?: string;
+  /** Presentation override for this instance only. Driver branding stays
+   * unchanged and custom images are admitted as bounded local data URLs. */
+  icon?: ProviderIcon;
   environment?: Record<string, string>;
   enabled?: boolean;
   config?: unknown;

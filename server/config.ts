@@ -10,6 +10,7 @@ import { normalizeImageGenerationUrl, type ImageGenerationConfig } from "../shar
 import { writeFileAtomic } from "./atomic.ts";
 import { EFFORT_LEVELS } from "../shared/wire.ts";
 import { isModelVariant, type InstanceConfigMap, type ModelSelection } from "./contracts.ts";
+import { PROVIDER_ICON_PRESETS, providerIconError } from "../shared/provider-icon.ts";
 import type { McpServerSpec } from "./contracts.ts";
 import { isRemoteMcpServer, parseStoredMcpServer } from "./mcp-registry.ts";
 import { parseJson, schemaIssue, type JsonObject, type JsonValue } from "./schema.ts";
@@ -41,6 +42,20 @@ export function isValidSshAlias(value: unknown): value is string {
   return typeof value === "string" && SSH_ALIAS.test(value);
 }
 
+const CDP_PORT = /^[0-9]{1,5}$/;
+const CDP_URL = /^(https?|wss?):\/\/\S+$/i;
+
+/** A bare TCP port (agent-browser's `--cdp <port>` shorthand) or an
+ * http(s)/ws(s) URL to a Chrome DevTools Protocol endpoint. */
+export function isValidCdpTarget(value: unknown): value is string {
+  if (typeof value !== "string" || value === "") return false;
+  if (CDP_PORT.test(value)) {
+    const port = Number(value);
+    return port >= 1 && port <= 65535;
+  }
+  return CDP_URL.test(value);
+}
+
 /** Keep the persisted VPS shape deliberately smaller than an SSH connection. */
 export function normalizeVpsConfig(raw: unknown): { sshAlias?: string } {
   if (raw === undefined || raw === null) return {};
@@ -58,6 +73,16 @@ export function normalizeVpsConfig(raw: unknown): { sshAlias?: string } {
 const vpsConfigSchema = z.object({
   sshAlias: z.string().refine((value) => value === "" || isValidSshAlias(value), {
     message: "must be a simple SSH config alias",
+  }).optional(),
+});
+/** Attach a bot's browser to a Chrome the operator already has running,
+ * instead of agent-browser spawning its own (#1396). Deliberately a
+ * server-owned config field, not an env-var passthrough: the ambient
+ * process environment must never redirect a bot's browser
+ * (server/browser-live.test.ts pins this guarantee down). */
+const browserEngineConfigSchema = z.object({
+  attachCdpUrl: z.string().trim().max(2048).refine((value) => value === "" || isValidCdpTarget(value), {
+    message: "browserEngine.attachCdpUrl must be a CDP port (1-65535) or an http(s)/ws(s) URL",
   }).optional(),
 });
 const roomConfigSchema = z.object({
@@ -275,6 +300,11 @@ const instanceConfigSchema = z.object({
   driver: z.string().min(1),
   displayName: optionalText,
   accentColor: optionalText,
+  icon: z.discriminatedUnion("kind", [
+    z.object({ kind: z.literal("preset"), preset: z.enum(PROVIDER_ICON_PRESETS) }).strict(),
+    z.object({ kind: z.literal("custom"), dataUrl: z.string() }).strict()
+      .refine((icon) => providerIconError(icon) === null, { message: "Invalid provider icon" }),
+  ]).optional(),
   environment: z.record(z.string(), z.string()).optional(),
   enabled: z.boolean().optional(),
   config: z.json().optional(),
@@ -396,6 +426,8 @@ const appConfigSchema = z.object({
   localVm: localVmConfigSchema.optional(),
   features: featureConfigSchema.optional(),
   onboarding: onboardingConfigSchema.optional(),
+  /** CDP attach target for a bot's browser; see browserEngineConfigSchema. */
+  browserEngine: browserEngineConfigSchema.optional(),
   browserProfiles: browserProfilesSchema.optional(),
   instances: instanceConfigMapSchema.optional(),
   /** User-configured MCP servers, mounted into every capable engine. Kept
@@ -446,6 +478,10 @@ export interface AppConfig {
   onboarding?: { completedAt?: string; version?: number; reelSeen?: boolean; hintsSeen?: string[] };
   /** Named browser sessions any bot can be pointed at. */
   browserProfiles?: BrowserProfile[];
+  /** CDP target of a Chrome the operator already has running (a bare port,
+   * e.g. "9333", or an http(s)/ws(s) URL). When set, a bot's browser
+   * attaches to it instead of agent-browser spawning its own (#1396). */
+  browserEngine?: { attachCdpUrl?: string };
   instances?: InstanceConfigMap;
 }
 export type BrowserProfile = z.output<typeof browserProfileSchema> & {
@@ -555,6 +591,14 @@ export function parseConfigPatch(value: JsonValue): ConfigPatch {
 
 export function vpsSshAlias(cfg: AppConfig): string | null {
   return isValidSshAlias(cfg.vps?.sshAlias) ? cfg.vps.sshAlias : null;
+}
+
+/** Read-and-revalidate accessor, same shape as vpsSshAlias above: even
+ * though loadConfig()/parseStoredConfig() already schema-validate this
+ * field, callers that forward it into a child process environment get a
+ * second, cheap guarantee rather than trusting a hand-edited config.json. */
+export function browserEngineAttachCdpUrl(cfg: AppConfig): string | null {
+  return isValidCdpTarget(cfg.browserEngine?.attachCdpUrl) ? cfg.browserEngine.attachCdpUrl : null;
 }
 
 export function roomTurnTimeoutMinutes(cfg: AppConfig): number {
@@ -870,7 +914,7 @@ export function saveConfig(patch: Partial<AppConfig>, options: { replaceInstance
   // back after we have successfully recognized the legacy list.
   const storedProfiles = storedBrowserProfilesSchema.safeParse(disk.browserProfiles);
   if (storedProfiles.success) disk.browserProfiles = storedProfiles.data;
-  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding"] as const) {
+  for (const key of ["xai", "anthropic", "openaiCompat", "composio", "box", "opencodeGo", "tts", "imageGen", "profile", "rooms", "threads", "localVm", "features", "budgets", "billing", "onboarding", "browserEngine"] as const) {
     const section = checkedPatch[key];
     if (!section) continue;
     const current = jsonObjectSchema.safeParse(disk[key]);
